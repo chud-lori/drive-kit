@@ -1,0 +1,1077 @@
+#!/usr/bin/env bash
+#
+# dk — NTFS (read/write) and ext2/3/4 external drives on Apple Silicon macOS
+# using free open-source drivers (no Paragon/Tuxera needed).
+#
+set -euo pipefail
+
+VERSION="0.4.0"
+MOUNT_ROOT="${EXTDISK_MOUNT_ROOT:-/Volumes}"
+DAEMON_LABEL="com.drivekit.automount"
+DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
+DAEMON_BIN="/usr/local/libexec/drivekit-automountd"
+DAEMON_LOG="/var/log/drivekit-automount.log"
+
+# ---------- ui helpers ----------
+c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_grn=$'\033[32m'
+c_yel=$'\033[33m'; c_off=$'\033[0m'
+ok()   { printf '%s✔%s %s\n' "$c_grn" "$c_off" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_yel" "$c_off" "$*"; }
+err()  { printf '%s✘%s %s\n' "$c_red" "$c_off" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Homebrew keg-only/sbin tools (e2fsprogs, mkntfs & friends) onto PATH
+for p in /opt/homebrew/opt/e2fsprogs /usr/local/opt/e2fsprogs; do
+  [[ -d "$p/sbin" ]] && PATH="$PATH:$p/sbin:$p/bin"
+done
+# launchd daemons get a bare PATH — include Homebrew bins explicitly
+PATH="$PATH:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
+
+usage() {
+  cat <<'EOF'
+dk — NTFS (read/write) and ext2/3/4 external drives on macOS,
+          using free open-source drivers.
+
+Disks:
+  dk list                   external disks, partitions, filesystems, mount state
+  dk mount [--ro] [id]      mount NTFS/ext partitions (all, or diskX / diskXsY)
+  dk unmount [id]           unmount so the drive can be unplugged safely
+  dk info <id>              detailed volume/filesystem info
+
+Maintenance (Paragon-style):
+  dk check <id>             verify filesystem (read-only, no changes)
+  dk repair <id>            repair: full fsck for ext; journal/dirty-flag reset for NTFS
+  dk label <id> [NAME]      show or change the volume label
+  dk format <id> <fs> [NAME]  erase as ntfs|ext4|ext3|ext2|exfat|fat32  (DESTRUCTIVE)
+
+Drive tools:
+  dk health <id>            SMART health check — is this drive failing?
+  dk benchmark <id> [--write]  sequential read (and optional write) speed test
+  dk clone <src> -o <img|diskY>  clone a disk/partition to an image or another disk
+  dk partition list|shrink|grow|create|delete   resize/manage partitions (DANGEROUS)
+
+Automount (plug in -> mounts read-write by itself):
+  dk automount enable|disable|status
+
+Data recovery (deleted files / formatted disks):
+  dk recover scan <src>            list deleted files still recoverable by name
+  dk recover files <src> -o DIR    recover them (keeps names when possible)
+  dk recover carve <src> -o DIR    deep signature scan (formatted/damaged disks)
+  dk recover image <src> -o IMG    safely image a failing drive first (ddrescue)
+  dk recover deps --install        install the recovery engines
+
+Setup:
+  dk doctor                 check that required drivers/tools are installed
+  dk setup                  install the free driver stack via Homebrew
+  dk remove-paragon         cleanly remove a Paragon NTFS installation/leftovers
+EOF
+}
+
+# Resolve the real project dir even when dk is invoked via a PATH symlink
+project_dir() {
+  local s="$0" d
+  while [[ -L "$s" ]]; do
+    d="$(cd "$(dirname "$s")" && pwd)"
+    s="$(readlink "$s")"
+    [[ "$s" != /* ]] && s="$d/$s"
+  done
+  cd "$(dirname "$s")" && pwd
+}
+
+cmd_recover() {
+  local dir; dir="$(project_dir)"
+  [[ -f "$dir/recovery/recover.py" ]] || die "recovery module missing at $dir/recovery/recover.py"
+  have python3 || die "python3 required (install Xcode Command Line Tools: xcode-select --install)"
+  exec python3 "$dir/recovery/recover.py" "$@"
+}
+
+# ---------- disk inspection ----------
+# External physical partition identifiers (diskXsY), plus whole-disk ids for
+# partition-table-less ("superfloppy") drives.
+external_partitions() {
+  diskutil list external physical 2>/dev/null | awk '
+    /^ *[0-9]+:/ {
+      id = $NF
+      if (id ~ /^disk[0-9]+s[0-9]+$/) print id
+      else if (id ~ /^disk[0-9]+$/ && $0 !~ /partition_scheme/) print id
+    }' || true
+}
+
+part_info() { # $1=disk id  $2=plist key -> value, or "" if missing
+  local out
+  out="$(diskutil info -plist "$1" 2>/dev/null | plutil -extract "$2" raw -o - - 2>/dev/null)" || out=""
+  [[ "$out" == "null" ]] && out=""
+  printf '%s' "$out"
+}
+
+is_external() { [[ "$(part_info "$1" Internal)" != "true" ]]; }
+
+# Classify a partition: ntfs, ext, exfat, fat, apfs/hfs, ntfs?, other.
+# Trust macOS's FilesystemType when present; fall back to partition Content;
+# probe raw signature (needs sudo) only when asked and still ambiguous.
+part_kind() { # $1=id  $2="probe"|"noprobe" (default noprobe)
+  local id="$1" probe="${2:-noprobe}" content fstype
+  fstype="$(part_info "$id" FilesystemType)"
+  content="$(part_info "$id" Content)"
+  [[ "$content" == "EFI" ]] && { echo other; return; }
+  case "$fstype" in
+    ntfs|ufsd_NTFS) echo ntfs;     return ;;
+    ext2|ext3|ext4) echo ext;      return ;;
+    exfat)          echo exfat;    return ;;
+    msdos)          echo fat;      return ;;
+    apfs|hfs)       echo apfs/hfs; return ;;
+  esac
+  case "$content" in
+    Windows_NTFS|Microsoft\ Basic\ Data)
+      # MBR type 0x07 / MS Basic Data is used for both NTFS and exFAT
+      if [[ "$probe" == "probe" ]]; then probe_signature "$id"; else echo "ntfs?"; fi ;;
+    Linux\ Filesystem)          echo ext ;;   # NOT bare Linux* — excludes Swap/LUKS
+    Windows_FAT_32|DOS_FAT_*)   echo fat ;;
+    Apple_APFS|Apple_HFS)       echo apfs/hfs ;;
+    *)                          echo other ;;
+  esac
+}
+
+# Read raw signatures to distinguish NTFS/exFAT/ext (needs sudo for /dev access).
+probe_signature() {
+  local id="$1" sig magic
+  sig="$(sudo dd if="/dev/$id" bs=8 count=1 2>/dev/null | LC_ALL=C tr -d '\0' | strings | head -1)" || sig=""
+  case "$sig" in
+    *NTFS*)  echo ntfs;  return ;;
+    *EXFAT*) echo exfat; return ;;
+  esac
+  # ext superblock magic 0xEF53 (little-endian) at byte offset 1024+56
+  magic="$(sudo dd if="/dev/$id" bs=1 count=2 skip=1080 2>/dev/null | xxd -p)" || magic=""
+  [[ "$magic" == "53ef" ]] && echo ext || echo other
+}
+
+volume_label() { # best-effort label for mountpoint naming; never empty
+  local id="$1" name
+  name="$(part_info "$id" VolumeName)"
+  name="$(printf '%s' "$name" | tr -cd '[:alnum:] ._-' | sed 's/^ *//;s/ *$//')"
+  printf '%s' "${name:-$id}"
+}
+
+# MountPoint from diskutil, else from mount(8) — FUSE mounts (ntfs-3g etc.)
+# often don't show a MountPoint on the underlying partition in diskutil.
+mount_point_of() {
+  local id="$1" mp
+  mp="$(part_info "$id" MountPoint)"
+  [[ -n "$mp" ]] || mp="$(mount | sed -n "s|^/dev/$id on \(.*\) (.*|\1|p" | head -1)"
+  printf '%s' "$mp"
+}
+
+# First free mountpoint for a label: "/Volumes/X", "/Volumes/X 1", ...
+unique_mountpoint() {
+  local base="$1" mp="$1" n=1
+  while mount | grep -qF " on $mp (" || { [[ -d "$mp" ]] && [[ -n "$(ls -A "$mp" 2>/dev/null)" ]]; }; do
+    mp="$base $n"; n=$((n+1))
+  done
+  printf '%s' "$mp"
+}
+
+# Expand a user-supplied target (diskX or diskXsY) to partition ids, verifying
+# it exists and is external (EXTDISK_ALLOW_INTERNAL=1 overrides).
+expand_target() {
+  local target="$1" parts
+  [[ "$target" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || die "Not a disk identifier: $target (expected diskX or diskXsY)"
+  diskutil info "$target" >/dev/null 2>&1 || die "No such disk: $target (see: dk list)"
+  if [[ "${EXTDISK_ALLOW_INTERNAL:-}" != "1" ]] && ! is_external "$target"; then
+    die "$target is an internal disk — refusing (set EXTDISK_ALLOW_INTERNAL=1 to override)."
+  fi
+  if [[ "$target" =~ ^disk[0-9]+$ ]]; then
+    parts="$(external_partitions | grep -E "^${target}(s[0-9]+)?$")" || true
+    [[ -n "$parts" ]] || die "No partitions found on $target (see: dk list)"
+    printf '%s' "$parts"
+  else
+    printf '%s' "$target"
+  fi
+}
+
+# Single-partition target for maintenance commands (check/repair/label/info/format)
+single_target() {
+  local target="${1:-}" out
+  [[ -n "$target" ]] || die "Which disk? e.g.: dk $2 disk4s1 (see: dk list)"
+  out="$(expand_target "$target")"
+  [[ "$out" != *$'\n'* ]] || die "$target has multiple partitions — pick one (see: dk list)"
+  printf '%s' "$out"
+}
+
+ensure_unmounted() { # release any mount (native or FUSE) before surgery
+  local id="$1" mp
+  mp="$(mount_point_of "$id")"
+  [[ -n "$mp" ]] || return 0
+  echo "Unmounting $id ($mp) first..."
+  sudo umount "$mp" 2>/dev/null || diskutil unmount "$id" >/dev/null 2>&1 \
+    || sudo diskutil unmount "$id" >/dev/null \
+    || die "Could not unmount $id — close whatever is using it and retry."
+  [[ "$mp" == "$MOUNT_ROOT/"* ]] && sudo rmdir "$mp" 2>/dev/null || true
+}
+
+confirm_or_die() { # $1 = word user must type, $2.. = warning lines
+  local expect="$1"; shift
+  local line
+  for line in "$@"; do warn "$line"; done
+  if [[ "${EXTDISK_YES:-}" == "1" ]]; then warn "(confirmed via --yes)"; return 0; fi
+  printf 'Type %s%s%s to continue: ' "$c_bold" "$expect" "$c_off"
+  read -r line || line=""
+  [[ "$line" == "$expect" ]] || die "Aborted."
+}
+
+# ---------- core commands ----------
+cmd_list() {
+  local parts id kind label mp
+  parts="$(external_partitions)"
+  if [[ -z "$parts" ]]; then
+    warn "No external disks detected."
+    echo "  If the drive is plugged in but absent here, it is not a filesystem"
+    echo "  problem: try another cable/port, and check 'system_profiler SPUSBDataType'."
+    return 0
+  fi
+  printf '%s%-10s %-10s %-22s %s%s\n' "$c_bold" IDENT TYPE LABEL "MOUNTED AT" "$c_off"
+  while IFS= read -r id; do
+    kind="$(part_kind "$id" noprobe)"
+    label="$(volume_label "$id")"
+    mp="$(mount_point_of "$id")"
+    [[ -n "$mp" ]] || mp="${c_dim}(not mounted)${c_off}"
+    printf '%-10s %-10s %-22s %b\n' "$id" "$kind" "$label" "$mp"
+  done <<< "$parts"
+}
+
+cmd_doctor() {
+  local all_ok=1
+  echo "${c_bold}dk doctor${c_off} (macOS $(sw_vers -productVersion), $(uname -m))"
+  echo
+
+  if have brew; then ok "Homebrew: $(brew --version | head -1)"; else
+    err "Homebrew missing — install from https://brew.sh"; all_ok=0; fi
+
+  if [[ -d "/Library/Filesystems/macfuse.fs" ]] || brew list --cask macfuse >/dev/null 2>&1; then
+    ok "macFUSE installed"
+    if kmutil showloaded 2>/dev/null | grep -qi macfuse; then
+      ok "macFUSE kernel extension loaded (fastest backend)"
+    else
+      warn "macFUSE kext not loaded yet."
+      echo "    Approve it in System Settings > Privacy & Security after the first mount attempt,"
+      echo "    or dk falls back to the user-space FSKit backend (macOS 15.4+, manual mounts only):"
+      echo "    System Settings > General > Login Items & Extensions > File System Extensions"
+    fi
+  else
+    err "macFUSE not installed — run: dk setup"; all_ok=0
+  fi
+
+  if [[ -d "/Library/Frameworks/fuse_t.framework" ]]; then
+    warn "fuse-t is installed, but dk's drivers are built against macFUSE and won't use it."
+  fi
+  if [[ -d "/Library/Filesystems/ufsd_NTFS.fs" ]] || [[ -d "/Library/Extensions/ufsd_NTFS.kext" ]]; then
+    warn "Paragon NTFS driver present — it intercepts NTFS disks before dk can."
+    echo "    Remove it with: dk remove-paragon"
+  fi
+
+  if have ntfs-3g; then ok "ntfs-3g: $(ntfs-3g --version 2>&1 | head -1)"; else
+    err "ntfs-3g missing — run: dk setup"; all_ok=0; fi
+  if have mkntfs && have ntfsfix && have ntfslabel; then
+    ok "NTFS toolbox (mkntfs, ntfsfix, ntfslabel, ntfsinfo, ntfsclone, ntfsresize, ntfsundelete)"
+  elif have ntfs-3g; then
+    warn "ntfs-3g present but its extra tools (mkntfs/ntfsfix/...) not found on PATH."
+  fi
+
+  if have fuse2fs; then ok "fuse2fs (ext2/3/4 read-write, experimental): $(fuse2fs -V 2>&1 | head -1)"
+  elif have ext4fuse; then
+    ok "ext4fuse (ext2/3/4 READ-ONLY)"
+    echo "    ${c_dim}ext write needs a Linux VM — see README.${c_off}"
+  else err "No ext driver (ext4fuse) — run: dk setup"; all_ok=0; fi
+
+  if have e2fsck && have mke2fs; then ok "e2fsprogs (e2fsck, mke2fs, e2label, tune2fs, resize2fs)"; else
+    warn "e2fsprogs missing (needed for ext check/repair/format) — run: dk setup"; fi
+
+  if [[ -f "$DAEMON_PLIST" ]]; then ok "Automount daemon installed (dk automount status)"; else
+    echo "  ${c_dim}Tip: 'dk automount enable' mounts NTFS drives read-write automatically on plug-in.${c_off}"; fi
+
+  echo
+  if [[ "$all_ok" == 1 ]]; then ok "All good. Plug in the drive and run: dk mount"
+  else warn "Fix the items above, then re-run: dk doctor"; return 1; fi
+}
+
+cmd_setup() {
+  have brew || die "Homebrew required — install from https://brew.sh first."
+  # Stack (verified July 2026, Apple Silicon / macOS 15):
+  #   macfuse cask        — FUSE layer (kext backend preferred; FSKit fallback >=15.4)
+  #   gromgit/fuse tap    — ntfs-3g-mac (NTFS r/w + full ntfsprogs), ext4fuse-mac
+  #   e2fsprogs           — e2fsck/mke2fs/e2label/tune2fs for ext volumes
+  echo "Installing the free driver stack (macFUSE + ntfs-3g + ext4fuse + e2fsprogs)..."
+  if ! brew list --cask macfuse >/dev/null 2>&1; then
+    echo "Installing macFUSE (needs your sudo password)..."
+    brew install --cask macfuse
+  fi
+  brew tap gromgit/fuse 2>/dev/null || true
+  brew trust --tap gromgit/fuse >/dev/null 2>&1 || true   # Homebrew 6 tap trust
+  brew install gromgit/fuse/ntfs-3g-mac gromgit/fuse/ext4fuse-mac e2fsprogs
+  # extra tooling: SMART health, partition editing (recovery engines are 'dk recover deps')
+  brew install smartmontools gptfdisk
+  echo
+  echo "${c_bold}One-time step:${c_off} enable the macFUSE file-system extension in"
+  echo "  System Settings > General > Login Items & Extensions > File System Extensions"
+  echo "and, if prompted after your first mount, approve macFUSE in Privacy & Security."
+  echo
+  cmd_doctor
+}
+
+# Pick the macFUSE backend: kernel extension if it's loaded; otherwise the
+# user-space FSKit backend on macOS >=15.4 (FSKit doesn't work from the root
+# automount daemon — the daemon forces the kext backend).
+fuse_backend_opts() {
+  if [[ -n "${EXTDISK_BACKEND:-}" ]]; then
+    [[ "$EXTDISK_BACKEND" == "kext" ]] && return 0
+    echo "-o backend=$EXTDISK_BACKEND"; return 0
+  fi
+  if kmutil showloaded 2>/dev/null | grep -qi macfuse; then
+    return 0
+  fi
+  local ver major minor
+  ver="$(sw_vers -productVersion)"
+  [[ "$ver" == *.* ]] || ver="$ver.0"
+  major="${ver%%.*}"; minor="${ver#*.}"; minor="${minor%%.*}"
+  if (( major > 15 || (major == 15 && minor >= 4) )); then
+    echo "-o backend=fskit"
+  fi
+}
+
+require_stack_for() { # $1 = ntfs|ext
+  case "$1" in
+    ntfs) have ntfs-3g || die "ntfs-3g not installed — run: dk setup" ;;
+    ext)  have fuse2fs || have ext4fuse || die "No ext driver — run: dk setup" ;;
+  esac
+}
+
+do_mount_ntfs() {
+  local id="$1" label mp cur
+  if mount | grep -E "^/dev/$id on " | grep -qi -e macfuse -e ntfs-3g; then
+    ok "$id is already mounted read-write ($(mount_point_of "$id"))"; return 0
+  fi
+  cur="$(mount_point_of "$id")"
+  if [[ "${EXTDISK_RO:-}" == "1" ]]; then
+    # read-only requested: macOS's native NTFS driver is the most stable ro option
+    if [[ -n "$cur" ]]; then ok "$id already mounted read-only at $cur"; return 0; fi
+    if diskutil mount "$id" >/dev/null; then ok "Mounted $id read-only (native driver)."
+    else err "Could not mount $id read-only"; return 1; fi
+    return 0
+  fi
+  if [[ -n "$cur" ]]; then
+    echo "Unmounting macOS read-only mount at $cur ..."
+    diskutil unmount "$id" >/dev/null || sudo diskutil unmount "$id" >/dev/null \
+      || { err "Could not release existing mount on $id"; return 1; }
+  fi
+  label="$(volume_label "$id")"
+  mp="$(unique_mountpoint "$MOUNT_ROOT/$label")"
+  # own files as the console user, not root, when run from the automount daemon
+  local muid mgid
+  if [[ "$(id -u)" == "0" ]]; then
+    muid="$(stat -f %u /dev/console)"; mgid="$(stat -f %g /dev/console)"
+  else
+    muid="$(id -u)"; mgid="$(id -g)"
+  fi
+  sudo mkdir -p "$mp"
+  echo "Mounting /dev/$id read-write at $mp (ntfs-3g)..."
+  # shellcheck disable=SC2046  # backend opts intentionally word-split
+  if sudo ntfs-3g "/dev/$id" "$mp" \
+      -o local -o allow_other -o auto_xattr -o windows_names -o big_writes \
+      -o uid="$muid" -o gid="$mgid" -o volname="$label" \
+      $(fuse_backend_opts); then
+    ok "Mounted: $mp (read-write) — visible in Finder"
+  else
+    sudo rmdir "$mp" 2>/dev/null || true
+    err "ntfs-3g failed to mount $id"
+    if have ntfsfix && sudo ntfsfix -n "/dev/$id" 2>&1 | grep -qi dirty; then
+      warn "The volume looks dirty (unclean Windows shutdown). Try: dk repair $id"
+    fi
+    return 1
+  fi
+}
+
+do_mount_ext() {
+  local id="$1" label mp rc=0
+  if mount | grep -qE "^/dev/$id on "; then
+    ok "$id is already mounted ($(mount_point_of "$id"))"; return 0
+  fi
+  label="$(volume_label "$id")"
+  mp="$(unique_mountpoint "$MOUNT_ROOT/$label")"
+  if have fuse2fs && [[ "${EXTDISK_RO:-}" != "1" ]]; then
+    # fuse2fs refuses volumes with an unreplayed journal; check & replay first.
+    if have e2fsck; then sudo e2fsck -p "/dev/$id" || rc=$?; fi
+    if (( rc >= 4 )); then
+      err "e2fsck found errors it could not fix on $id (exit $rc) — refusing read-write mount."
+      warn "Falling back to read-only if possible; run: dk repair $id"
+      if have ext4fuse; then mount_ext_readonly "$id" "$mp"; return $?; fi
+      return 1
+    fi
+    sudo mkdir -p "$mp"
+    echo "Mounting /dev/$id read-write at $mp (fuse2fs — experimental on macOS)..."
+    # shellcheck disable=SC2046
+    if sudo fuse2fs "/dev/$id" "$mp" -o fakeroot,allow_other $(fuse_backend_opts); then
+      ok "Mounted: $mp (read-write via fuse2fs — keep backups, this driver is experimental)"
+    else
+      sudo rmdir "$mp" 2>/dev/null || true
+      err "fuse2fs failed to mount $id"; return 1
+    fi
+  else
+    mount_ext_readonly "$id" "$mp"
+  fi
+}
+
+mount_ext_readonly() {
+  local id="$1" mp="$2"
+  sudo mkdir -p "$mp"
+  echo "Mounting /dev/$id READ-ONLY at $mp (ext4fuse)..."
+  # shellcheck disable=SC2046
+  if sudo ext4fuse "/dev/$id" "$mp" -o allow_other $(fuse_backend_opts); then
+    ok "Mounted: $mp (read-only) — visible in Finder"
+    echo "  ${c_dim}ext write on macOS has no reliable free driver; for writing, use a"
+    echo "  Linux VM with USB passthrough (see README) or copy files while mounted read-only.${c_off}"
+  else
+    sudo rmdir "$mp" 2>/dev/null || true
+    err "ext4fuse failed to mount $id"; return 1
+  fi
+}
+
+cmd_mount() {
+  local target="" parts id kind mounted_any=0 failed=0 mp arg
+  for arg in "$@"; do
+    case "$arg" in
+      --ro|--read-only) EXTDISK_RO=1 ;;
+      *) target="$arg" ;;
+    esac
+  done
+  if [[ -n "$target" ]]; then parts="$(expand_target "$target")"
+  else parts="$(external_partitions)"; fi
+  [[ -n "$parts" ]] || die "No external disks detected — is the drive plugged in? (see: dk list)"
+  while IFS= read -r id; do
+    kind="$(part_kind "$id" probe)"
+    case "$kind" in
+      ntfs) require_stack_for ntfs; do_mount_ntfs "$id" && mounted_any=1 || failed=1 ;;
+      ext)  require_stack_for ext;  do_mount_ext  "$id" && mounted_any=1 || failed=1 ;;
+      exfat|fat|apfs/hfs)
+        mp="$(mount_point_of "$id")"
+        if [[ -z "$mp" ]]; then
+          if diskutil mount "$id" >/dev/null; then ok "Mounted $id natively ($kind)."
+          else warn "Could not mount $id"; failed=1; fi
+        else
+          ok "$id already mounted at $mp (native $kind)"
+        fi ;;
+      *) warn "Skipping $id (unrecognized filesystem: $kind)" ;;
+    esac
+  done <<< "$parts"
+  if [[ "$failed" == 1 ]]; then return 1; fi
+  [[ "$mounted_any" == 1 ]] || warn "No NTFS/ext partitions found to mount."
+}
+
+cmd_unmount() {
+  local target="${1:-}" parts id mp failed=0 did_any=0
+  if [[ -n "$target" ]]; then parts="$(expand_target "$target")"
+  else parts="$(external_partitions)"; fi
+  [[ -n "$parts" ]] || { warn "No external disks detected."; return 0; }
+  while IFS= read -r id; do
+    mp="$(mount_point_of "$id")"
+    [[ -n "$mp" ]] || continue
+    did_any=1
+    echo "Unmounting $id ($mp)..."
+    if sudo umount "$mp" 2>/dev/null || diskutil unmount "$id" >/dev/null 2>&1; then
+      ok "Unmounted $id"
+      # clean up mountpoint dirs we created (native ones are auto-removed)
+      [[ "$mp" == "$MOUNT_ROOT/"* ]] && sudo rmdir "$mp" 2>/dev/null || true
+    else
+      failed=1
+      err "Could not unmount $id — something is still using it."
+      echo "  Close Finder windows/apps using it, or find the culprit: sudo lsof +D \"$mp\""
+      echo "  Last resort (may lose unsaved writes): diskutil unmount force $id"
+    fi
+  done <<< "$parts"
+  if [[ "$failed" == 1 ]]; then
+    die "NOT safe to unplug — some volumes are still mounted."
+  fi
+  if [[ "$did_any" == 1 ]]; then ok "Safe to unplug."
+  else ok "Nothing was mounted. Safe to unplug."; fi
+}
+
+# ---------- maintenance commands (Paragon parity) ----------
+cmd_info() {
+  local id kind
+  id="$(single_target "${1:-}" info)"
+  kind="$(part_kind "$id" probe)"
+  echo "${c_bold}== diskutil ==${c_off}"
+  diskutil info "$id" | grep -E 'Device Node|Volume Name|Disk Size|Volume Used|File System|Mounted|Mount Point|Media Name|Protocol|Content' || true
+  case "$kind" in
+    ntfs)
+      have ntfsinfo || die "ntfsinfo not installed — run: dk setup"
+      echo; echo "${c_bold}== ntfsinfo ==${c_off}"
+      sudo ntfsinfo -m -f "/dev/$id" 2>/dev/null | head -30 || warn "ntfsinfo could not read $id (mounted volumes need unmounting first)" ;;
+    ext)
+      have dumpe2fs || die "dumpe2fs not installed — run: dk setup"
+      echo; echo "${c_bold}== dumpe2fs ==${c_off}"
+      sudo dumpe2fs -h "/dev/$id" 2>/dev/null || warn "dumpe2fs could not read $id" ;;
+    *) echo; warn "No extra details for filesystem type: $kind" ;;
+  esac
+}
+
+cmd_check() {
+  local id kind
+  id="$(single_target "${1:-}" check)"
+  kind="$(part_kind "$id" probe)"
+  ensure_unmounted "$id"
+  case "$kind" in
+    ntfs)
+      have ntfsfix || die "ntfsfix not installed — run: dk setup"
+      echo "Checking NTFS on $id (read-only)..."
+      if sudo ntfsfix -n "/dev/$id"; then ok "$id looks consistent."
+      else warn "Problems reported — see above. Fix with: dk repair $id"; return 1; fi ;;
+    ext)
+      have e2fsck || die "e2fsck not installed — run: dk setup"
+      echo "Checking ext filesystem on $id (read-only)..."
+      if sudo e2fsck -f -n "/dev/$id"; then ok "$id looks consistent."
+      else warn "Problems reported — see above. Fix with: dk repair $id"; return 1; fi ;;
+    exfat|fat|apfs/hfs)
+      echo "Checking $id with macOS's own verifier..."
+      diskutil verifyVolume "$id" ;;
+    *) die "Don't know how to check filesystem type: $kind" ;;
+  esac
+}
+
+cmd_repair() {
+  local id kind
+  id="$(single_target "${1:-}" repair)"
+  kind="$(part_kind "$id" probe)"
+  ensure_unmounted "$id"
+  case "$kind" in
+    ntfs)
+      have ntfsfix || die "ntfsfix not installed — run: dk setup"
+      warn "NTFS repair on macOS fixes the journal, dirty flag, and boot sector only."
+      warn "Deep structural repair needs Windows chkdsk (ntfsfix schedules one for next Windows boot)."
+      sudo ntfsfix "/dev/$id" && ok "Done. Try: dk mount $id" ;;
+    ext)
+      have e2fsck || die "e2fsck not installed — run: dk setup"
+      echo "Running full e2fsck repair on $id ..."
+      local rc=0
+      sudo e2fsck -f -y "/dev/$id" || rc=$?
+      if (( rc <= 2 )); then ok "Repair finished (exit $rc). Try: dk mount $id"
+      else err "e2fsck could not fully repair $id (exit $rc)."; return 1; fi ;;
+    exfat|fat|apfs/hfs)
+      echo "Repairing $id with macOS's own repairer..."
+      diskutil repairVolume "$id" ;;
+    *) die "Don't know how to repair filesystem type: $kind" ;;
+  esac
+}
+
+cmd_label() {
+  local id kind new="${2:-}"
+  id="$(single_target "${1:-}" label)"
+  kind="$(part_kind "$id" probe)"
+  if [[ -z "$new" ]]; then
+    echo "Current label of $id: $(volume_label "$id")"
+    return 0
+  fi
+  case "$kind" in
+    ntfs)
+      have ntfslabel || die "ntfslabel not installed — run: dk setup"
+      ensure_unmounted "$id"
+      sudo ntfslabel "/dev/$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+    ext)
+      have e2label || die "e2label not installed — run: dk setup"
+      ensure_unmounted "$id"
+      sudo e2label "/dev/$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+    exfat|fat|apfs/hfs)
+      diskutil rename "$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+    *) die "Don't know how to label filesystem type: $kind" ;;
+  esac
+}
+
+cmd_format() {
+  local target="${1:-}" fs="${2:-}" label="${3:-Untitled}" id slice
+  [[ -n "$target" && -n "$fs" ]] || die "Usage: dk format <diskX|diskXsY> <ntfs|ext4|ext3|ext2|exfat|fat32> [LABEL]"
+  [[ "$target" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || die "Not a disk identifier: $target"
+  diskutil info "$target" >/dev/null 2>&1 || die "No such disk: $target"
+  if [[ "${EXTDISK_ALLOW_INTERNAL:-}" != "1" ]] && ! is_external "$target"; then
+    die "$target is an internal disk — refusing to format."
+  fi
+  case "$fs" in ntfs|ext4|ext3|ext2|exfat|fat32) ;; *) die "Unsupported filesystem: $fs" ;; esac
+  case "$fs" in
+    ntfs)           have mkntfs || die "mkntfs not installed — run: dk setup" ;;
+    ext2|ext3|ext4) have mke2fs || die "mke2fs not installed — run: dk setup" ;;
+  esac
+
+  local size name
+  size="$(part_info "$target" TotalSize)"; name="$(part_info "$target" MediaName)"
+  [[ -n "$name" ]] || name="$(part_info "${target%s[0-9]*}" MediaName)"   # slices: use parent disk's name
+  confirm_or_die "$target" \
+    "THIS ERASES ALL DATA on $target (${name:-unknown device}, ${size:-?} bytes) -> $fs \"$label\""
+
+  if [[ "$target" =~ ^disk[0-9]+$ ]]; then
+    # Whole disk: build a fresh GPT with one Microsoft Basic Data partition,
+    # then lay the target filesystem over the data slice.
+    case "$fs" in
+      exfat)  diskutil eraseDisk ExFAT "$label" GPT "$target"; ok "Formatted $target as exFAT."; return 0 ;;
+      fat32)  diskutil eraseDisk "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" GPT "$target"; ok "Formatted $target as FAT32."; return 0 ;;
+      *)      diskutil partitionDisk "$target" 1 GPT ExFAT "TMPFMT" R >/dev/null
+              # find the new data slice from the target itself (EFI, if any, sorts first)
+              slice="$(diskutil list -plist "$target" 2>/dev/null \
+                | plutil -extract AllDisks json -o - - 2>/dev/null \
+                | tr -d '[]" ' | tr ',' '\n' | grep -E "^${target}s[0-9]+$" | tail -1)" || true
+              [[ -n "$slice" ]] || die "Could not find the new data partition on $target" ;;
+    esac
+  else
+    slice="$target"
+    case "$fs" in
+      exfat)  ensure_unmounted "$slice"; diskutil eraseVolume ExFAT "$label" "$slice"; ok "Formatted $slice as exFAT."; return 0 ;;
+      fat32)  ensure_unmounted "$slice"; diskutil eraseVolume "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" "$slice"; ok "Formatted $slice as FAT32."; return 0 ;;
+    esac
+  fi
+
+  diskutil unmountDisk "${slice%s[0-9]*}" >/dev/null 2>&1 || true   # close async-automount race
+  ensure_unmounted "$slice"
+  case "$fs" in
+    ntfs)
+      echo "Creating NTFS on /dev/r$slice (mkntfs quick format)..."
+      sudo mkntfs -f -L "$label" "/dev/r$slice"
+      ok "Formatted $slice as NTFS \"$label\". Mount it: dk mount $slice" ;;
+    ext2|ext3|ext4)
+      echo "Creating $fs on /dev/r$slice (mke2fs)..."
+      sudo mke2fs -t "$fs" -L "$label" "/dev/r$slice"
+      ok "Formatted $slice as $fs \"$label\". Mount it: dk mount $slice" ;;
+  esac
+}
+
+# ---------- automount daemon ----------
+daemon_reconcile() {
+  local id kind
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    kind="$(part_kind "$id" probe)" || continue
+    [[ "$kind" == "ntfs" ]] || continue
+    do_mount_ntfs "$id" || true
+  done <<< "$(external_partitions)"
+}
+
+cmd_daemon() {
+  [[ "$(id -u)" == "0" ]] || die "daemon must run as root (use: dk automount enable)"
+  export EXTDISK_BACKEND=kext   # FSKit is per-user; not usable from a root daemon
+  echo "[drivekit-automountd $VERSION] starting; initial reconcile"
+  daemon_reconcile || true
+  # `diskutil activity` is used ONLY as a wake-up signal; all decisions are
+  # re-derived from `diskutil info` (its stream format is not a stable API).
+  diskutil activity 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *DiskAppeared*) sleep 2; echo "[drivekit-automountd] disk appeared; reconciling"; daemon_reconcile || true ;;
+    esac
+  done
+}
+
+cmd_automount() {
+  local action="${1:-status}"
+  case "$action" in
+    enable)
+      require_stack_for ntfs
+      if ! kmutil showloaded 2>/dev/null | grep -qi macfuse; then
+        warn "The automount daemon needs the macFUSE kernel extension (FSKit doesn't work for"
+        warn "background daemons). It will load on first mount; approve it in Privacy & Security if asked."
+      fi
+      echo "Installing automount daemon (needs sudo)..."
+      sudo mkdir -p "$(dirname "$DAEMON_BIN")"
+      sudo cp "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$DAEMON_BIN"
+      sudo chown root:wheel "$DAEMON_BIN"; sudo chmod 755 "$DAEMON_BIN"
+      sudo tee "$DAEMON_PLIST" >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$DAEMON_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$DAEMON_BIN</string><string>daemon</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$DAEMON_LOG</string>
+  <key>StandardErrorPath</key><string>$DAEMON_LOG</string>
+</dict></plist>
+EOF
+      sudo chown root:wheel "$DAEMON_PLIST"; sudo chmod 644 "$DAEMON_PLIST"
+      sudo launchctl bootout system "$DAEMON_PLIST" 2>/dev/null || true
+      sudo launchctl bootstrap system "$DAEMON_PLIST"
+      ok "Automount enabled — NTFS drives now mount read-write automatically on plug-in."
+      echo "  Log: $DAEMON_LOG   Disable with: dk automount disable" ;;
+    disable)
+      sudo launchctl bootout system "$DAEMON_PLIST" 2>/dev/null || true
+      sudo rm -f "$DAEMON_PLIST" "$DAEMON_BIN"
+      ok "Automount disabled and removed." ;;
+    status)
+      if [[ -f "$DAEMON_PLIST" ]]; then
+        ok "Automount daemon installed."
+        if sudo launchctl print "system/$DAEMON_LABEL" >/dev/null 2>&1; then ok "Daemon is loaded and running."
+        else warn "Daemon installed but not loaded — try: dk automount enable"; fi
+        [[ -f "$DAEMON_LOG" ]] && { echo "Recent log:"; tail -5 "$DAEMON_LOG"; }
+      else
+        echo "Automount is not enabled. Enable with: dk automount enable"
+      fi ;;
+    *) die "Usage: dk automount enable|disable|status" ;;
+  esac
+}
+
+# ---------- paragon removal ----------
+cmd_remove_paragon() {
+  [[ "$(id -u)" != "0" ]] || die "Run remove-paragon as your normal user (it uses sudo where needed) — running it under sudo would skip your user-level Paragon files."
+  local vendor="/Library/Application Support/Paragon Software/com.paragon-software.ntfs.uninstall"
+  local found=0 f
+  echo "${c_bold}Paragon NTFS components on this Mac:${c_off}"
+  for f in /Library/Filesystems/ufsd_NTFS.fs /Library/Extensions/ufsd_NTFS.kext \
+           "/Library/Application Support/Paragon Software" \
+           /Library/LaunchDaemons/com.paragon-software.ntfsd.plist \
+           /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist \
+           /Library/LaunchDaemons/com.paragon-software.installer.plist \
+           /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist \
+           /Library/PrivilegedHelperTools/com.paragon-software.installer \
+           /Library/PreferencePanes/ParagonNTFS.prefPane; do
+    [[ -e "$f" ]] && { echo "  $f"; found=1; }
+  done
+  if kmutil showloaded 2>/dev/null | grep -qi -e ufsd -e paragon; then
+    echo "  (kernel driver currently LOADED)"; found=1
+  fi
+  [[ "$found" == 1 ]] || { ok "No Paragon NTFS components found — nothing to remove."; return 0; }
+
+  confirm_or_die "REMOVE" \
+    "This permanently removes Paragon NTFS from this Mac (needs sudo)." \
+    "After removal, NTFS goes back to macOS native read-only until you use dk."
+
+  if [[ -x "$vendor" ]]; then
+    echo "Running Paragon's own uninstaller..."
+    sudo "$vendor" || warn "Vendor uninstaller reported errors; continuing with cleanup."
+  fi
+
+  echo "Cleaning up what the vendor uninstaller leaves behind..."
+  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.ntfsd.plist 2>/dev/null || true
+  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist 2>/dev/null || true
+  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.installer.plist 2>/dev/null || true
+  launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist 2>/dev/null || true
+  sudo kextunload -b com.paragon-software.filesystems.ntfs 2>/dev/null || true
+  sudo rm -rf /Library/Filesystems/ufsd_NTFS.fs /Library/Extensions/ufsd_NTFS.kext \
+    /Library/LaunchDaemons/com.paragon-software.ntfsd.plist \
+    /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist \
+    /Library/LaunchDaemons/com.paragon-software.installer.plist \
+    /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist \
+    /Library/PrivilegedHelperTools/com.paragon-software.installer \
+    "/Library/Application Support/Paragon Software" \
+    /Library/PreferencePanes/ParagonNTFS.prefPane \
+    /usr/local/sbin/fsck_ufsd_NTFS /usr/local/sbin/mount_ufsd_NTFS /usr/local/sbin/newfs_ufsd_NTFS
+  rm -rf ~/Library/Preferences/com.paragon-software.ntfs* \
+         ~/Library/Caches/com.paragon-software.ntfs* \
+         ~/Library/HTTPStorages/com.paragon-software.ntfs* \
+         ~/Library/WebKit/com.paragon-software.ntfs.fsapp \
+         ~/Library/Saved\ Application\ State/com.paragon-software.ntfs.fsapp.savedState 2>/dev/null || true
+  local pkg
+  for pkg in $(pkgutil --pkgs 2>/dev/null | grep -i paragon); do
+    sudo pkgutil --forget "$pkg" >/dev/null && echo "  forgot receipt: $pkg"
+  done
+  sudo kmutil clear-staging 2>/dev/null || true
+
+  if kmutil showloaded 2>/dev/null | grep -qi -e ufsd -e paragon; then
+    warn "The Paragon kernel driver is still loaded in memory — REBOOT to finish removal."
+  else
+    ok "Paragon NTFS fully removed."
+  fi
+  echo "Verify afterwards with: dk doctor"
+}
+
+# ---------- health (SMART) ----------
+cmd_health() {
+  local id whole node
+  [[ -n "${1:-}" ]] || die "Which disk? e.g.: dk health disk4 (see: dk list)"
+  # SMART is read-only, so it's safe on the internal disk too; accept whole disk or partition.
+  id="$(EXTDISK_ALLOW_INTERNAL=1 expand_single "$1")"
+  whole="${id%s[0-9]*}"                    # strip trailing sN only; smartctl wants the whole disk
+  node="/dev/$whole"
+  have smartctl || die "smartmontools not installed — run: dk setup (or brew install smartmontools)"
+  echo "Reading SMART health for $whole ..."
+  # Try without sudo first (works for internal disks), then with sudo (needed for
+  # most external drives); for each, try auto then common USB-bridge pass-through types.
+  local priv dt json='' used=''
+  for priv in "" "sudo"; do
+    for dt in "" "-d sat" "-d sat,12" "-d usbjmicron" "-d usbprolific" "-d usbsunplus" "-d sntrealtek,/sat"; do
+      # shellcheck disable=SC2086
+      json="$($priv smartctl -j -a $dt "$node" 2>/dev/null || true)"
+      if printf '%s' "$json" | grep -q '"smart_status"'; then used="${dt:-auto}"; break 2; fi
+    done
+  done
+  if [[ -z "$json" ]] || ! printf '%s' "$json" | grep -q '"smart_status"'; then
+    err "Could not read SMART data from $whole."
+    echo "  This is usually the USB enclosure blocking SMART pass-through, not the disk."
+    echo "  Try a different adapter, or connect the drive over SATA/Thunderbolt."
+    return 1
+  fi
+  printf '%s' "$json" | python3 "$(project_dir)/lib/smart_verdict.py" "$whole" "$used"
+}
+
+# ---------- benchmark ----------
+cmd_benchmark() {
+  local id="" write=0 arg mp node out rate
+  for arg in "$@"; do case "$arg" in --write|-w) write=1 ;; *) id="$arg" ;; esac; done
+  [[ -n "$id" ]] || die "Which disk? e.g.: dk benchmark disk4 (see: dk list)"
+  id="$(expand_single "$id")"            # whole disk or a partition
+  node="/dev/r$id"
+  echo "Sequential read test on $id (1 GiB, read-only)..."
+  [[ "$(uname)" == "Darwin" ]] && sudo purge 2>/dev/null || true
+  out="$(sudo dd if="$node" of=/dev/null bs=1m count=1024 2>&1 | tail -1)"
+  rate="$(parse_dd_rate "$out")"
+  ok "Read: ${rate:-?} MB/s"
+  if [[ "$write" == 1 ]]; then
+    mp="$(mount_point_of "$id")"
+    [[ -n "$mp" ]] || die "Write test needs the volume mounted — run: dk mount $id"
+    trap 'rm -f "$mp/dk_bench.tmp"' RETURN     # clean up even on interrupt/failure
+    echo "Sequential write test (1 GiB) to $mp/dk_bench.tmp ..."
+    out="$(dd if=/dev/zero of="$mp/dk_bench.tmp" bs=1m count=1024 2>&1 | tail -1)"; sync
+    rm -f "$mp/dk_bench.tmp"
+    ok "Write: $(parse_dd_rate "$out") MB/s"
+  fi
+  echo "  ${c_dim}Numbers can be capped by the USB bridge, not the disk; sustained speed may be lower.${c_off}"
+}
+
+parse_dd_rate() { # bytes/sec (macOS) or "N MB/s" (GNU) -> MB/s integer
+  local line="$1" bps
+  if [[ "$line" == *bytes/sec* ]]; then
+    bps="$(printf '%s' "$line" | sed -n 's/.*(\([0-9]*\) bytes\/sec).*/\1/p')"
+    [[ -n "$bps" ]] && echo $(( bps / 1000000 ))
+  else
+    printf '%s' "$line" | sed -n 's/.*, \([0-9.]*\) \([GM]B\)\/s.*/\1 \2/p' | awk '{print ($2=="GB")?int($1*1000):int($1)}'
+  fi
+}
+
+# ---------- clone ----------
+cmd_clone() {
+  local src="" dst=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) dst="${2:-}"; shift 2 ;;
+      *) [[ -z "$src" ]] && src="$1"; shift ;;
+    esac
+  done
+  [[ -n "$src" && -n "$dst" ]] || die "Usage: dk clone <diskX|diskXsY> -o <image.img | diskY>   (image, or another disk)"
+  have ddrescue || die "ddrescue not installed — run: dk recover deps --install"
+  local srcp; srcp="$(expand_single "$src")"
+  local srcnode="/dev/r$srcp"
+  ensure_unmounted "$srcp"
+  if [[ "$dst" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || [[ "$dst" == /dev/* ]]; then
+    # disk-to-disk (or partition): DESTRUCTIVE to target
+    local tgt="${dst#/dev/}"; tgt="${tgt#r}"
+    diskutil info "$tgt" >/dev/null 2>&1 || die "No such target disk: $dst"
+    is_external "$tgt" || [[ "${EXTDISK_ALLOW_INTERNAL:-}" == 1 ]] || die "Target $tgt is internal — refusing."
+    local ssz tsz; ssz="$(part_info "$srcp" TotalSize)"; tsz="$(part_info "$tgt" TotalSize)"
+    [[ -z "$ssz" || -z "$tsz" ]] || (( tsz >= ssz )) || die "Target ($(human "$tsz")) is smaller than source ($(human "$ssz"))."
+    confirm_or_die "$tgt" "CLONE $srcp -> $tgt ERASES ALL DATA on $tgt ($(human "${tsz:-0}"))."
+    ensure_unmounted "$tgt"
+    echo "Cloning $srcp -> $tgt (ddrescue)..."
+    sudo ddrescue -f "$srcnode" "/dev/r$tgt" "$(scratch_map "$tgt")"
+    ok "Clone complete. Verify: sudo cmp -n ${ssz:-0} $srcnode /dev/r$tgt"
+  else
+    # disk-to-image file
+    local img="$dst"; [[ "$img" == /* ]] || img="$(pwd)/$img"
+    guard_image_dir "$img" "$srcp"
+    [[ ! -e "$img" || -e "$img.map" ]] || die "$img already exists (no .map) — refusing to overwrite. Delete it or choose another path."
+    mkdir -p "$(dirname "$img")"
+    echo "Imaging $srcp -> $img (ddrescue, resumable)..."
+    sudo ddrescue -f "$srcnode" "$img" "$img.map"
+    ok "Image saved: $img (resume map: $img.map)"
+    echo "  Recover from it without the disk:  dk recover scan $img"
+  fi
+}
+
+expand_single() { # like single_target but for clone/partition sources (id required, exists, external)
+  local t="$1"
+  [[ "$t" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || die "Not a disk identifier: $t (see: dk list)"
+  diskutil info "$t" >/dev/null 2>&1 || die "No such disk: $t"
+  [[ "${EXTDISK_ALLOW_INTERNAL:-}" == 1 ]] || is_external "$t" || die "$t is an internal disk — refusing."
+  printf '%s' "$t"
+}
+
+scratch_map() { printf '%s' "${TMPDIR:-/tmp}/dk-clone-$1.map"; }
+
+guard_image_dir() { # refuse writing the image onto the source disk
+  local img="$1" src="$2" dir dev
+  local src_whole="${src%s[0-9]*}"
+  dir="$(dirname "$img")"
+  while [[ ! -d "$dir" && "$dir" != "/" ]]; do dir="$(dirname "$dir")"; done   # nearest existing ancestor
+  [[ -d "$dir" ]] || die "Cannot resolve a location for $img"
+  dev="$(df "$dir" 2>/dev/null | awk 'NR==2{print $1}')"
+  dev="${dev#/dev/}"; dev="${dev#r}"
+  [[ ! "$dev" =~ ^${src_whole}(s[0-9]+)?$ ]] || die "Refusing to write the image onto the source disk ($src). Pick another location."
+}
+
+# ---------- partition (shrink/grow/create/delete/list) ----------
+cmd_partition() {
+  local action="${1:-list}"; [[ $# -gt 0 ]] && shift
+  case "$action" in
+    list)   part_list "$@" ;;
+    shrink) part_resize shrink "$@" ;;
+    grow)   part_resize grow "$@" ;;
+    delete) part_delete "$@" ;;
+    create) part_create "$@" ;;
+    *) die "Usage: dk partition list|shrink|grow|create|delete ..." ;;
+  esac
+}
+
+part_require() {
+  have sgdisk || die "sgdisk not installed — run: dk setup (or brew install gptfdisk)"
+}
+
+part_list() {
+  local disk="${1:-}"
+  [[ -n "$disk" ]] || die "Usage: dk partition list <diskX>"
+  disk="$(expand_single "${disk%s[0-9]*}")"
+  part_require
+  echo "${c_bold}Partitions on $disk:${c_off}"
+  sudo sgdisk -p "/dev/$disk"
+}
+
+# shrink/grow an ext or NTFS partition. Filesystem-first for shrink, partition-first for grow.
+part_resize() {
+  local mode="$1" id="${2:-}" size="${3:-}"
+  [[ -n "$id" ]] || die "Usage: dk partition $mode <diskXsY> <newsize e.g. 200G>   (grow: size optional = fill free space)"
+  id="$(expand_single "$id")"
+  [[ "$id" == *s* ]] || die "$id is a whole disk — give a partition like ${id}s1"
+  part_require
+  local disk="${id%s[0-9]*}" pnum="${id##*s}" kind
+  kind="$(part_kind "$id" probe)"
+  case "$kind" in
+    ext) have resize2fs || die "resize2fs not installed — run: dk setup" ;;
+    ntfs) have ntfsresize || die "NTFS resize needs ntfsresize (macFUSE stack) — run: dk setup" ;;
+    *) die "Can only resize ext or NTFS partitions (this is: $kind)" ;;
+  esac
+  ensure_unmounted "$id"
+
+  # geometry (512-byte sectors) + current name/GUID to preserve across the rewrite
+  local start pname info
+  info="$(sudo sgdisk -i "$pnum" "/dev/$disk")"
+  start="$(printf '%s' "$info" | awk '/First sector/{print $3}')"
+  pname="$(printf '%s' "$info" | sed -n "s/^Partition name: '\(.*\)'\$/\1/p")"
+  [[ -n "$start" ]] || die "Could not read partition $pnum geometry from $disk"
+
+  warn "Partition resize is the most dangerous operation — a crash mid-resize can lose the whole partition."
+  echo "Back up first if the data matters:  dk clone $disk -o ~/backup.img"
+  confirm_or_die "$id" "About to $mode $id ($kind)."
+
+  if [[ "$mode" == shrink ]]; then
+    [[ -n "$size" ]] || die "shrink needs a target size, e.g. dk partition shrink $id 200G"
+    local need_sectors end
+    if [[ "$kind" == ext ]]; then
+      echo "Checking filesystem (must be clean)..."; sudo e2fsck -f -y "/dev/$id" || die "e2fsck could not clean $id — aborting."
+      echo "Shrinking ext filesystem to $size..."
+      sudo resize2fs "/dev/$id" "$size" || die "resize2fs failed — partition untouched."
+      need_sectors="$(fs_sectors_ext "$id")"
+    else
+      echo "NTFS dry-run..."; sudo ntfsresize --no-action --size "$size" "/dev/$id" || die "ntfsresize dry-run failed."
+      sudo ntfsresize -f --size "$size" "/dev/$id" || die "ntfsresize failed — partition untouched."
+      need_sectors=$(( $(size_to_bytes "$size") / 512 ))
+    fi
+    end=$(( start + ( (need_sectors + 2047) / 2048 + 1 ) * 2048 - 1 ))   # round up to MiB + 1 MiB margin
+    echo "Shrinking partition entry to sectors $start..$end ..."
+    sudo sgdisk -d "$pnum" -n "$pnum:$start:$end" -t "$pnum:$(gpt_code "$kind")" -c "$pnum:$pname" "/dev/$disk"
+    sudo sgdisk -e "/dev/$disk"
+  else   # grow
+    echo "Growing partition entry to fill free space after it..."
+    sudo sgdisk -d "$pnum" -n "$pnum:$start:0" -t "$pnum:$(gpt_code "$kind")" -c "$pnum:$pname" "/dev/$disk"
+    sudo sgdisk -e "/dev/$disk"
+    rescan_disk "$disk"
+    if [[ "$kind" == ext ]]; then
+      sudo e2fsck -f -y "/dev/$id" || true
+      echo "Growing ext filesystem to fill the partition..."
+      sudo resize2fs "/dev/$id" || die "resize2fs failed."
+    else
+      sudo ntfsresize -f "/dev/$id" || die "ntfsresize failed."
+    fi
+  fi
+  rescan_disk "$disk"
+  echo "Verifying..."
+  [[ "$kind" == ext ]] && sudo e2fsck -f -n "/dev/$id" || sudo ntfsresize --no-action "/dev/$id" || true
+  ok "$mode of $id complete."
+}
+
+part_delete() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "Usage: dk partition delete <diskXsY>"
+  id="$(expand_single "$id")"; [[ "$id" == *s* ]] || die "Give a partition (diskXsY), not a whole disk"
+  part_require
+  ensure_unmounted "$id"
+  confirm_or_die "$id" "DELETE partition $id — its data becomes unreachable."
+  sudo sgdisk -d "${id##*s}" "/dev/${id%s[0-9]*}"; sudo sgdisk -e "/dev/${id%s[0-9]*}"
+  rescan_disk "${id%s[0-9]*}"; ok "Deleted $id."
+}
+
+part_create() {
+  local disk="${1:-}" fs="${2:-}" label="${3:-Untitled}"
+  [[ -n "$disk" && -n "$fs" ]] || die "Usage: dk partition create <diskX> <ext4|ntfs|exfat> [LABEL]   (fills free space)"
+  disk="$(expand_single "${disk%s[0-9]*}")"; part_require
+  confirm_or_die "$disk" "Create a new $fs partition in free space on $disk."
+  local before after pnum
+  before="$(sudo sgdisk -p "/dev/$disk" | awk '/^ +[0-9]+ /{print $1}' | sort -n)"
+  sudo sgdisk -n "0:0:0" -t "0:$(gpt_code "$fs")" -c "0:$label" "/dev/$disk"; sudo sgdisk -e "/dev/$disk"
+  rescan_disk "$disk"
+  after="$(sudo sgdisk -p "/dev/$disk" | awk '/^ +[0-9]+ /{print $1}' | sort -n)"
+  pnum="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)"
+  [[ -n "$pnum" ]] || die "Partition created but could not determine its number — check: dk partition list $disk"
+  ok "Created partition ${disk}s${pnum}. Format it:  dk format ${disk}s${pnum} $fs \"$label\""
+}
+
+fs_sectors_ext() { # partition bytes currently used by the ext fs, in 512-byte sectors
+  local id="$1" blocks bs
+  blocks="$(sudo dumpe2fs -h "/dev/$id" 2>/dev/null | awk -F: '/Block count/{print $2}' | tr -d ' ')"
+  bs="$(sudo dumpe2fs -h "/dev/$id" 2>/dev/null | awk -F: '/Block size/{print $2}' | tr -d ' ')"
+  echo $(( blocks * bs / 512 ))
+}
+
+size_to_bytes() { # 200G / 500M / 1024K -> bytes
+  local s="$1" n="${1%[KMGTkmgt]}" u="${1##*[0-9]}"
+  case "$u" in K|k) echo $(( n * 1024 ));; M|m) echo $(( n * 1024*1024 ));;
+    G|g) echo $(( n * 1024*1024*1024 ));; T|t) echo $(( n * 1024*1024*1024*1024 ));; *) echo "$s";; esac
+}
+
+gpt_code() { case "$1" in ext) echo 8300;; ntfs|exfat|fat|fat32) echo 0700;; *) echo 8300;; esac; }
+
+rescan_disk() { # make the kernel re-read the partition table
+  local disk="$1"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    diskutil unmountDisk "/dev/$disk" >/dev/null 2>&1 || true
+    diskutil mountDisk "/dev/$disk"   >/dev/null 2>&1 || true
+  else
+    sudo partprobe "/dev/$disk" 2>/dev/null || true
+  fi
+}
+
+main() {
+  local cmd="${1:-list}"
+  [[ $# -gt 0 ]] && shift
+  # global --yes for scripted destructive commands
+  local args=() a
+  for a in "$@"; do
+    if [[ "$a" == "--yes" || "$a" == "-y" ]]; then EXTDISK_YES=1; else args+=("$a"); fi
+  done
+  set -- "${args[@]+"${args[@]}"}"
+  case "$cmd" in
+    list|ls|status)       cmd_list "$@" ;;
+    doctor)               cmd_doctor "$@" ;;
+    setup)                cmd_setup "$@" ;;
+    mount)                cmd_mount "$@" ;;
+    unmount|umount|eject) cmd_unmount "$@" ;;
+    info)                 cmd_info "$@" ;;
+    check|verify)         cmd_check "$@" ;;
+    repair|fix)           cmd_repair "$@" ;;
+    label|rename)         cmd_label "$@" ;;
+    format|erase)         cmd_format "$@" ;;
+    automount)            cmd_automount "$@" ;;
+    recover|rescue)       cmd_recover "$@" ;;
+    daemon)               cmd_daemon "$@" ;;
+    health|smart)         cmd_health "$@" ;;
+    benchmark|bench|speed) cmd_benchmark "$@" ;;
+    clone)                cmd_clone "$@" ;;
+    partition|part)       cmd_partition "$@" ;;
+    remove-paragon)       cmd_remove_paragon "$@" ;;
+    -h|--help|help)       usage ;;
+    -v|--version)         echo "dk $VERSION" ;;
+    *) usage >&2; die "Unknown command: $cmd" ;;
+  esac
+}
+main "$@"

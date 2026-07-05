@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Tool runtime artifacts — never commit recovered data, disk images, or logs
+recovered/
+rescued/
+carved/
+*.img
+*.dmg
+*.map
+*.ddrescue
+drivekit-automount.log
+photorec.log
+recovery/engines/          # downloaded/bundled engine binaries, if any
+
+# Scratch / test output
+scratch/
+*.tmp
+test-out/
