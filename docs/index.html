@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drivekit</title>
+<meta name="description" content="External drives on macOS without Paragon or Tuxera: NTFS and ext read-write, verify, repair, format, and data recovery with free open-source drivers. A disk toolkit on Linux too.">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef1f5;
+    --border: #d7dbe3;
+    --text: #191c22;
+    --muted: #596070;
+    --accent: #a65510;
+    --accent-ink: #ffffff;
+    --accent-weak: rgba(166, 85, 16, 0.10);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 1080px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1116;
+      --surface: #161922;
+      --surface-2: #1d212b;
+      --border: #2b313d;
+      --text: #e7e9ee;
+      --muted: #9aa3b4;
+      --accent: #e08a34;
+      --accent-ink: #1a1205;
+      --accent-weak: rgba(224, 138, 52, 0.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1116;
+    --surface: #161922;
+    --surface-2: #1d212b;
+    --border: #2b313d;
+    --text: #e7e9ee;
+    --muted: #9aa3b4;
+    --accent: #e08a34;
+    --accent-ink: #1a1205;
+    --accent-weak: rgba(224, 138, 52, 0.12);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:hover { text-decoration: underline; }
+  h1, h2, h3 { line-height: 1.2; letter-spacing: -0.01em; }
+  code, kbd, .mono { font-family: var(--mono); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+  .wrap { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 16px; }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    color: var(--accent);
+    margin: 0 0 0.6rem;
+  }
+  .kicker::before { content: "# "; opacity: 0.7; }
+
+  /* header */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav { display: flex; align-items: center; gap: 1.2rem; height: 58px; }
+  .brand { font-family: var(--mono); font-weight: 600; font-size: 1.05rem; letter-spacing: -0.02em; }
+  .brand .dk { color: var(--accent); }
+  .nav-links { display: flex; gap: 1.1rem; margin-left: auto; align-items: center; }
+  .nav-links a { color: var(--muted); text-decoration: none; font-size: 0.93rem; }
+  .nav-links a:hover { color: var(--text); }
+  .theme-btn {
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.35rem 0.6rem; font: inherit; font-size: 0.85rem; cursor: pointer;
+  }
+  .theme-btn:hover { border-color: var(--accent); }
+  @media (max-width: 720px) {
+    .nav-links a.navlink { display: none; }
+  }
+
+  /* hero */
+  .hero { padding: 4.2rem 0 3rem; border-bottom: 1px solid var(--border); }
+  .hero h1 { font-size: clamp(2.1rem, 6vw, 3.4rem); margin: 0 0 1rem; }
+  .hero p.lead { font-size: 1.18rem; color: var(--muted); max-width: 42ch; margin: 0 0 1.8rem; }
+  .cta-row { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: center; }
+  .btn {
+    display: inline-block; font: inherit; font-weight: 600;
+    padding: 0.7rem 1.2rem; border-radius: 7px; text-decoration: none; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); }
+  .btn-primary:hover { filter: brightness(1.06); text-decoration: none; }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--border); }
+  .btn-ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+  /* generic section */
+  section { padding: 3.4rem 0; border-bottom: 1px solid var(--border); }
+  section h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 0.6rem; }
+  section > .wrap > p.intro { color: var(--muted); max-width: 58ch; margin: 0 0 2rem; }
+
+  /* code sample */
+  .sample {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.1rem; overflow-x: auto; font-family: var(--mono); font-size: 0.9rem;
+    line-height: 1.75; color: var(--text); white-space: pre; tab-size: 2;
+  }
+  @media (max-width: 720px) { .sample { font-size: 0.8rem; } }
+  .sample .c { color: var(--muted); }           /* comment */
+  .sample .p { color: var(--accent); }           /* prompt */
+  .sample b { color: var(--text); font-weight: 600; }
+
+  /* feature groups: deliberately uneven, not a 6-up grid */
+  .groups { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+  .group {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1.3rem 1.4rem;
+  }
+  .group.span { grid-column: 1 / -1; }
+  .group h3 { margin: 0 0 0.3rem; font-size: 1.1rem; }
+  .group p { margin: 0 0 0.9rem; color: var(--muted); font-size: 0.95rem; }
+  .group ul { margin: 0; padding-left: 0; list-style: none; }
+  .group li { padding: 0.32rem 0; border-top: 1px solid var(--border); display: flex; gap: 0.8rem; flex-wrap: wrap; }
+  .group li:first-child { border-top: 0; }
+  .group li code { color: var(--accent); font-size: 0.86rem; white-space: nowrap; }
+  .group li span { color: var(--muted); font-size: 0.92rem; }
+  @media (max-width: 720px) { .groups { grid-template-columns: 1fr; } }
+
+  /* parity table */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.93rem; min-width: 460px; }
+  th, td { text-align: left; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface-2); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  td .yes { color: var(--accent); font-weight: 600; }
+  td code { font-size: 0.85rem; }
+
+  /* install */
+  .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+  @media (max-width: 720px) { .steps { grid-template-columns: 1fr; } }
+  .steps .col h3 { margin: 0 0 0.6rem; font-size: 1.05rem; }
+  .req { color: var(--muted); font-size: 0.9rem; margin-top: 0.7rem; }
+
+  /* notes */
+  .note { border-left: 3px solid var(--accent); background: var(--accent-weak); padding: 0.8rem 1rem; border-radius: 0 8px 8px 0; margin: 0.8rem 0; }
+  .note p { margin: 0.2rem 0; font-size: 0.93rem; }
+
+  footer { padding: 2.4rem 0 3rem; color: var(--muted); font-size: 0.9rem; }
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--text); }
+  .foot-row { display: flex; flex-wrap: wrap; gap: 1.2rem; justify-content: space-between; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap nav">
+    <span class="brand">drive<span class="dk">kit</span></span>
+    <nav class="nav-links" aria-label="Primary">
+      <a class="navlink" href="#features">Features</a>
+      <a class="navlink" href="#commands">Commands</a>
+      <a class="navlink" href="#linux">Linux</a>
+      <a class="navlink" href="#install">Install</a>
+      <a href="https://github.com/chud-lori/drive-kit">GitHub</a>
+      <button class="theme-btn" id="theme" type="button" aria-label="Switch color theme">Theme</button>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero" style="border-bottom:0">
+    <div class="wrap">
+      <h1>External drives on macOS, without Paragon.</h1>
+      <p class="lead">Mount NTFS and ext read-write, verify, repair, format, and recover lost data, all with free open-source drivers. Run it as <code>dk</code>.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#install">Install it</a>
+        <a class="btn btn-ghost" href="https://github.com/chud-lori/drive-kit">Source on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="commands">
+    <div class="wrap">
+      <p class="kicker">a quick look</p>
+      <h2>Plug in a drive, see what is there, mount it.</h2>
+      <p class="intro">Every command takes a whole disk (<code>disk4</code>) or one partition (<code>disk4s1</code>). Destructive ones ask you to type the identifier back before they run.</p>
+      <div class="sample" aria-label="Example terminal session">
+<span class="c"># see what is plugged in</span>
+<span class="p">$</span> <b>dk list</b>
+IDENT      TYPE       LABEL              MOUNTED AT
+disk4s1    ntfs       FIELDWORK          (not mounted)
+disk5s2    ext        backup             (not mounted)
+
+<span class="c"># mount the NTFS volume read-write</span>
+<span class="p">$</span> <b>dk mount disk4s1</b>
+<span class="c"># write to ext4 through a short-lived Linux VM (Apple Silicon)</span>
+<span class="p">$</span> <b>dk mount --rw disk5s2</b>
+<span class="c"># done? release it before you unplug</span>
+<span class="p">$</span> <b>dk unmount</b>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <p class="kicker">what it does</p>
+      <h2>A full disk toolkit, not just a mounter.</h2>
+      <p class="intro">drivekit wraps the free open-source drivers and filesystem tools behind one command, with the unmount, confirmation, and never-overwrite-the-source guards handled for you.</p>
+      <div class="groups">
+        <div class="group span">
+          <h3>Mount</h3>
+          <p>NTFS is read-write by default. ext reads locally; writing opens a short-lived Linux VM so a real kernel driver does the work.</p>
+          <ul>
+            <li><code>dk mount</code><span>NTFS read-write (ntfs-3g); ext read-only (ext4fuse), no VM</span></li>
+            <li><code>dk mount --rw</code><span>ext read-write via anylinuxfs on Apple Silicon, falling back to fuse2fs</span></li>
+            <li><code>dk mount --ro</code><span>read-only session using the native driver</span></li>
+            <li><code>dk automount enable</code><span>mount NTFS drives read-write on plug-in</span></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Maintain</h3>
+          <p>Check and repair before data goes missing.</p>
+          <ul>
+            <li><code>dk check</code><span>read-only verify</span></li>
+            <li><code>dk repair</code><span>full fsck / NTFS journal reset</span></li>
+            <li><code>dk label</code><span>rename a volume</span></li>
+            <li><code>dk format</code><span>erase as ntfs/ext/exfat/fat</span></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Recover</h3>
+          <p>Get back deleted files, or image a failing drive first.</p>
+          <ul>
+            <li><code>dk recover scan</code><span>list recoverable files</span></li>
+            <li><code>dk recover carve</code><span>deep scan of a formatted disk</span></li>
+            <li><code>dk recover image</code><span>safe ddrescue image</span></li>
+          </ul>
+        </div>
+        <div class="group span">
+          <h3>Drive tools</h3>
+          <p>The things you reach for when a disk acts up.</p>
+          <ul>
+            <li><code>dk health</code><span>SMART check with a plain is-this-failing verdict</span></li>
+            <li><code>dk clone</code><span>image or clone a disk, refusing to write onto the source</span></li>
+            <li><code>dk partition</code><span>shrink, grow, create, or delete partitions</span></li>
+            <li><code>dk benchmark</code><span>sequential read and write speed</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="parity">
+    <div class="wrap">
+      <p class="kicker">instead of paying</p>
+      <h2>What you get in place of Paragon.</h2>
+      <p class="intro">drivekit covers the day-to-day reasons people buy Paragon NTFS/extFS or Disk Drill. A few things only a paid boot-time driver can do are called out honestly.</p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Task</th><th>drivekit</th><th>How</th></tr></thead>
+          <tbody>
+            <tr><td>NTFS read/write</td><td><span class="yes">Yes</span> <code>dk mount</code></td><td>ntfs-3g</td></tr>
+            <tr><td>ext2/3/4 read</td><td><span class="yes">Yes</span> <code>dk mount</code></td><td>ext4fuse (no VM)</td></tr>
+            <tr><td>ext4 write</td><td><span class="yes">Yes</span> <code>dk mount --rw</code></td><td>anylinuxfs (Linux VM, Apple Silicon)</td></tr>
+            <tr><td>Verify / repair</td><td><span class="yes">Yes</span> <code>dk check</code> / <code>repair</code></td><td>ntfsfix, e2fsck</td></tr>
+            <tr><td>Format / label</td><td><span class="yes">Yes</span> <code>dk format</code> / <code>label</code></td><td>mkntfs, mke2fs, diskutil</td></tr>
+            <tr><td>Deleted-file recovery</td><td><span class="yes">Yes</span> <code>dk recover</code></td><td>PhotoRec / ddrescue</td></tr>
+            <tr><td>Boot from NTFS / startup disk</td><td>No</td><td>needs a proprietary boot-time kext</td></tr>
+            <tr><td>Deep NTFS repair (chkdsk-level)</td><td>Partial</td><td>only Windows chkdsk; <code>repair</code> fixes the journal and dirty flag</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="linux">
+    <div class="wrap">
+      <p class="kicker">on linux too</p>
+      <h2>On Linux it is the repair and recovery toolkit.</h2>
+      <p class="intro">Linux already mounts ext, NTFS, and exFAT natively, so there is nothing to add there. drivekit brings the rest: the same check, repair, label, format, info, health, clone, partition, and recover commands, with the same safe-unmount and confirmation guards.</p>
+      <div class="sample" aria-label="Example Linux session">
+<span class="c"># device names are the Linux ones; a leading /dev/ is fine</span>
+<span class="p">$</span> <b>dk doctor</b>          <span class="c"># reports the toolkit binaries</span>
+<span class="p">$</span> <b>dk setup</b>           <span class="c"># installs via apt / dnf / pacman / zypper</span>
+<span class="p">$</span> <b>dk repair /dev/sdb1</b> <span class="c"># fsck after a safe unmount</span>
+<span class="p">$</span> <b>dk health sdb</b>
+      </div>
+      <div class="note">
+        <p>Mounting on Linux stays native, so <code>dk mount</code> / <code>unmount</code> / <code>automount</code> are macOS-only and tell you so.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <p class="kicker">get it running</p>
+      <h2>Install</h2>
+      <p class="intro">Clone the repository and run the installer. It links <code>dk</code> onto your PATH and installs the stack for your platform.</p>
+      <div class="steps">
+        <div class="col">
+          <h3>macOS</h3>
+          <div class="sample">
+<span class="p">$</span> git clone https://github.com/chud-lori/drive-kit
+<span class="p">$</span> cd drive-kit
+<span class="p">$</span> <b>./install.sh</b>
+          </div>
+          <p class="req">Needs Homebrew. Installs macFUSE, ntfs-3g, ext4fuse, and e2fsprogs; anylinuxfs is added on Apple Silicon for ext writes.</p>
+        </div>
+        <div class="col">
+          <h3>Linux</h3>
+          <div class="sample">
+<span class="p">$</span> git clone https://github.com/chud-lori/drive-kit
+<span class="p">$</span> cd drive-kit
+<span class="p">$</span> <b>./install.sh</b>
+          </div>
+          <p class="req">Uses your package manager to install e2fsprogs, ntfs-3g, exfatprogs, dosfstools, util-linux, gptfdisk, smartmontools, and ddrescue.</p>
+        </div>
+      </div>
+      <div class="note">
+        <p><strong>Writing ext on macOS</strong> runs a small Linux VM (anylinuxfs, Apple Silicon only) that uses about 256 MB of RAM while a write session is open, and shows the volume as a network drive. The first run downloads a Linux image once.</p>
+        <p><strong>Destructive commands</strong> (<code>format</code>, <code>partition</code>, <code>clone</code> to a disk) erase data and ask you to type the target identifier before running.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot-row">
+    <span>drivekit, a free open-source disk toolkit for macOS and Linux.</span>
+    <span><a href="https://github.com/chud-lori/drive-kit">github.com/chud-lori/drive-kit</a></span>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var btn = document.getElementById('theme');
+    var saved = null;
+    try { saved = localStorage.getItem('dk-theme'); } catch (e) {}
+    if (saved === 'light' || saved === 'dark') root.setAttribute('data-theme', saved);
+    btn.addEventListener('click', function () {
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      var current = root.getAttribute('data-theme') || (dark ? 'dark' : 'light');
+      var next = current === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('dk-theme', next); } catch (e) {}
+    });
+  })();
+</script>
+</body>
+</html>
