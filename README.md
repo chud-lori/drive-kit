@@ -1,7 +1,7 @@
 # drivekit
 
-A free disk toolkit for the Mac (recovery works on Linux too). Run it as
-`drivekit` or the short alias `dk`.
+A free disk toolkit for the Mac (and a check/repair/format/recover toolkit on
+Linux — see below). Run it as `drivekit` or the short alias `dk`.
 
 Mount **NTFS (read/write)** and **ext2/3/4** external drives, verify/repair/format
 disks, and **recover deleted or lost data** — all with free open-source engines.
@@ -63,6 +63,27 @@ dk remove-paragon        # cleanly strip a Paragon NTFS install/leftovers
 `mount`, `unmount`, etc. accept `diskX` (whole disk) or `diskXsY` (one
 partition). Destructive commands require typed confirmation (`--yes` to skip
 in scripts). Most commands use `sudo` and will ask for your password.
+
+## Linux
+
+On Linux the kernel mounts and writes ext/ntfs/exfat natively, so dk does not
+provide `mount` / `unmount` / `automount` there (use `mount` and `umount`).
+dk gives you the rest of the toolkit: `check`, `repair`, `label`, `format`,
+`info`, `health`, `clone`, `partition`, and `recover`, with the same
+safe-unmount, confirmation, and write-onto-source guards as on macOS.
+
+Device ids are the Linux names (`sdb1`, `nvme0n1p2`, `mmcblk0p1`); a leading
+`/dev/` is accepted. `dk setup` installs the stack with your package manager
+(apt/dnf/pacman/zypper): e2fsprogs, ntfs-3g, exfatprogs, dosfstools,
+util-linux, gptfdisk, smartmontools, ddrescue. `dk doctor` reports it.
+
+```sh
+dk list                  # removable disks and partitions (lsblk-backed)
+dk repair /dev/sdb1      # full fsck (ext/ntfs/exfat), after a safe unmount
+dk format sdb ext4 DATA  # GPT + mkfs, typed confirmation
+dk health sdb            # SMART verdict
+dk recover scan /dev/sdb1
+```
 
 ## Drive tools
 
