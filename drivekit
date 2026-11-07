@@ -5,7 +5,7 @@
 #
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 MOUNT_ROOT="${EXTDISK_MOUNT_ROOT:-/Volumes}"
 DAEMON_LABEL="com.drivekit.automount"
 DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
@@ -36,7 +36,7 @@ dk — NTFS (read/write) and ext2/3/4 external drives on macOS,
 
 Disks:
   dk list                   external disks, partitions, filesystems, mount state
-  dk mount [--ro] [id]      mount NTFS/ext partitions (all, or diskX / diskXsY)
+  dk mount [--ro|--rw] [id] mount NTFS/ext partitions (ext: --rw = read-write via VM)
   dk unmount [id]           unmount so the drive can be unplugged safely
   dk info <id>              detailed volume/filesystem info
 
@@ -154,12 +154,27 @@ volume_label() { # best-effort label for mountpoint naming; never empty
   printf '%s' "${name:-$id}"
 }
 
+# anylinuxfs exports its volume as a localhost NFS mount, invisible to mount(8)
+# as `/dev/$id on ...`; ask anylinuxfs where this partition landed instead.
+anylinuxfs_mount_point() {
+  local id="$1" mp=""
+  have anylinuxfs || return 0
+  # `anylinuxfs status` output format is UNVERIFIED against a live run — on a line
+  # naming this device, take an absolute path that isn't /dev; empty if no match.
+  mp="$(anylinuxfs status 2>/dev/null | awk -v id="$id" '
+    $0 ~ ("(^|[^0-9a-z])" id "([^0-9]|$)") {
+      for (i=1;i<=NF;i++) if ($i ~ /^\// && $i !~ /^\/dev\//) { print $i; exit }
+    }')" || true
+  printf '%s' "$mp"
+}
+
 # MountPoint from diskutil, else from mount(8) — FUSE mounts (ntfs-3g etc.)
 # often don't show a MountPoint on the underlying partition in diskutil.
 mount_point_of() {
   local id="$1" mp
   mp="$(part_info "$id" MountPoint)"
   [[ -n "$mp" ]] || mp="$(mount | sed -n "s|^/dev/$id on \(.*\) (.*|\1|p" | head -1)"
+  [[ -n "$mp" ]] || mp="$(anylinuxfs_mount_point "$id")"
   printf '%s' "$mp"
 }
 
@@ -199,11 +214,20 @@ single_target() {
   printf '%s' "$out"
 }
 
-ensure_unmounted() { # release any mount (native or FUSE) before surgery
+ensure_unmounted() { # release any mount (native, FUSE, or anylinuxfs VM) before surgery
   local id="$1" mp
   mp="$(mount_point_of "$id")"
   [[ -n "$mp" ]] || return 0
   echo "Unmounting $id ($mp) first..."
+  if have anylinuxfs && [[ -n "$(anylinuxfs_mount_point "$id")" ]]; then
+    # `anylinuxfs unmount` argument semantics are UNVERIFIED — try targeted, then bare
+    sudo anylinuxfs unmount "$mp" 2>/dev/null \
+      || sudo anylinuxfs unmount "/dev/$id" 2>/dev/null \
+      || sudo anylinuxfs unmount 2>/dev/null || true
+    [[ -z "$(anylinuxfs_mount_point "$id")" ]] \
+      || die "Could not release anylinuxfs mount for $id — check: anylinuxfs status"
+    return 0
+  fi
   sudo umount "$mp" 2>/dev/null || diskutil unmount "$id" >/dev/null 2>&1 \
     || sudo diskutil unmount "$id" >/dev/null \
     || die "Could not unmount $id — close whatever is using it and retry."
@@ -278,6 +302,11 @@ cmd_doctor() {
     warn "ntfs-3g present but its extra tools (mkntfs/ntfsfix/...) not found on PATH."
   fi
 
+  if have anylinuxfs; then
+    ok "anylinuxfs (ext2/3/4 read-write engine, VM-backed): dk mount --rw"
+  elif [[ "$(uname -m)" == "arm64" ]]; then
+    echo "    ${c_dim}Tip: 'dk setup' installs anylinuxfs for ext read-write (dk mount --rw).${c_off}"
+  fi
   if have fuse2fs; then ok "fuse2fs (ext2/3/4 read-write, experimental): $(fuse2fs -V 2>&1 | head -1)"
   elif have ext4fuse; then
     ok "ext4fuse (ext2/3/4 READ-ONLY)"
@@ -311,6 +340,12 @@ cmd_setup() {
   brew install gromgit/fuse/ntfs-3g-mac gromgit/fuse/ext4fuse-mac e2fsprogs
   # extra tooling: SMART health, partition editing (recovery engines are 'dk recover deps')
   brew install smartmontools gptfdisk
+  # ext read-write engine: VM-backed anylinuxfs (dk mount --rw), Apple Silicon only
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    have anylinuxfs || { brew tap nohajc/anylinuxfs; brew install anylinuxfs; }
+  else
+    echo "ext read-write (anylinuxfs) needs Apple Silicon — skipping it."
+  fi
   echo
   echo "${c_bold}One-time step:${c_off} enable the macFUSE file-system extension in"
   echo "  System Settings > General > Login Items & Extensions > File System Extensions"
@@ -342,7 +377,7 @@ fuse_backend_opts() {
 require_stack_for() { # $1 = ntfs|ext
   case "$1" in
     ntfs) have ntfs-3g || die "ntfs-3g not installed — run: dk setup" ;;
-    ext)  have fuse2fs || have ext4fuse || die "No ext driver — run: dk setup" ;;
+    ext)  have anylinuxfs || have fuse2fs || have ext4fuse || die "No ext driver — run: dk setup" ;;
   esac
 }
 
@@ -392,13 +427,28 @@ do_mount_ntfs() {
 }
 
 do_mount_ext() {
-  local id="$1" label mp rc=0
-  if mount | grep -qE "^/dev/$id on "; then
-    ok "$id is already mounted ($(mount_point_of "$id"))"; return 0
+  local id="$1" label mp cur rc=0
+  # an anylinuxfs mount is NFS and won't show as /dev/$id on, so detect via mount_point_of
+  cur="$(mount_point_of "$id")"
+  if [[ "${EXTDISK_RW:-}" != "1" ]]; then
+    if [[ -n "$cur" ]]; then ok "$id is already mounted ($cur)"; return 0; fi
+    label="$(volume_label "$id")"
+    mp="$(unique_mountpoint "$MOUNT_ROOT/$label")"
+    mount_ext_readonly "$id" "$mp"
+    return $?
+  fi
+  # read-write: release any existing (read-only) mount first — one mount per partition
+  if [[ -n "$cur" ]]; then
+    echo "Unmounting existing read-only mount at $cur ..."
+    diskutil unmount "$id" >/dev/null 2>&1 || sudo umount "$cur" 2>/dev/null \
+      || { err "Could not release existing mount on $id"; return 1; }
+    [[ "$cur" == "$MOUNT_ROOT/"* ]] && sudo rmdir "$cur" 2>/dev/null || true
   fi
   label="$(volume_label "$id")"
   mp="$(unique_mountpoint "$MOUNT_ROOT/$label")"
-  if have fuse2fs && [[ "${EXTDISK_RO:-}" != "1" ]]; then
+  if have anylinuxfs; then
+    mount_ext_anylinuxfs "$id" "$mp"
+  elif have fuse2fs; then
     # fuse2fs refuses volumes with an unreplayed journal; check & replay first.
     if have e2fsck; then sudo e2fsck -p "/dev/$id" || rc=$?; fi
     if (( rc >= 4 )); then
@@ -417,7 +467,19 @@ do_mount_ext() {
       err "fuse2fs failed to mount $id"; return 1
     fi
   else
-    mount_ext_readonly "$id" "$mp"
+    die "ext read-write needs anylinuxfs (Apple Silicon) or fuse2fs — run: dk setup"
+  fi
+}
+
+mount_ext_anylinuxfs() {
+  local id="$1" mp="$2"
+  sudo mkdir -p "$mp"
+  echo "Mounting /dev/$id read-write at $mp (anylinuxfs — Linux VM)..."
+  if sudo anylinuxfs mount "/dev/$id" "$mp"; then
+    ok "Mounted: $mp (read-write via a Linux VM) — appears in Finder as a network drive"
+  else
+    sudo rmdir "$mp" 2>/dev/null || true
+    err "anylinuxfs failed to mount $id"; return 1
   fi
 }
 
@@ -441,6 +503,7 @@ cmd_mount() {
   for arg in "$@"; do
     case "$arg" in
       --ro|--read-only) EXTDISK_RO=1 ;;
+      --rw|--read-write) EXTDISK_RW=1 ;;
       *) target="$arg" ;;
     esac
   done
@@ -477,6 +540,20 @@ cmd_unmount() {
     [[ -n "$mp" ]] || continue
     did_any=1
     echo "Unmounting $id ($mp)..."
+    if have anylinuxfs && [[ -n "$(anylinuxfs_mount_point "$id")" ]]; then
+      # `anylinuxfs unmount` argument semantics are UNVERIFIED — try targeted, then bare
+      sudo anylinuxfs unmount "$mp" 2>/dev/null \
+        || sudo anylinuxfs unmount "/dev/$id" 2>/dev/null \
+        || sudo anylinuxfs unmount 2>/dev/null || true
+      if [[ -z "$(anylinuxfs_mount_point "$id")" ]]; then
+        ok "Unmounted $id (anylinuxfs VM released)"
+      else
+        failed=1
+        err "Could not release anylinuxfs mount for $id — its VM still holds the device."
+        echo "  Inspect it: anylinuxfs status    Force: sudo anylinuxfs unmount"
+      fi
+      continue
+    fi
     if sudo umount "$mp" 2>/dev/null || diskutil unmount "$id" >/dev/null 2>&1; then
       ok "Unmounted $id"
       # clean up mountpoint dirs we created (native ones are auto-removed)

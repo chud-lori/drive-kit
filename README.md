@@ -24,8 +24,8 @@ gateway you browse files through.
 | Format NTFS / ext4 / exFAT / FAT32 | ✅ `dk format` | mkntfs, mke2fs, diskutil |
 | Volume label editing | ✅ `dk label` | ntfslabel, e2label |
 | Volume info | ✅ `dk info` | ntfsinfo, dumpe2fs |
-| ext2/3/4 read | ✅ | ext4fuse |
-| **ext4 write** | ⚠️ read-only | no reliable free driver exists (see below) |
+| ext2/3/4 read | ✅ `dk mount` | ext4fuse (read-only, no VM) |
+| **ext4 write** | ✅ `dk mount --rw` | anylinuxfs (Linux VM, Apple Silicon — see below) |
 | Menu-bar GUI | ❌ CLI by design | — |
 | Boot from NTFS / startup disk | ❌ | needs a proprietary boot-time kext |
 | Deep NTFS repair (chkdsk-level) | ⚠️ partial | only Windows chkdsk can; `repair` fixes journal/dirty flag & schedules chkdsk |
@@ -47,8 +47,9 @@ General → Login Items & Extensions → **File System Extensions**.
 
 ```sh
 dk list                  # what's plugged in
-dk mount                 # mount everything (NTFS read-write)
+dk mount                 # mount everything (NTFS read-write; ext read-only)
 dk mount --ro disk4      # read-only session
+dk mount --rw disk4s1    # ext read-write via a Linux VM (Apple Silicon)
 dk unmount               # then unplug — only after "Safe to unplug"
 dk automount enable      # Paragon-style: NTFS auto-mounts r/w on plug-in
 dk check disk4s1         # verify filesystem (no changes)
@@ -136,20 +137,35 @@ saving); and it warns before scanning a mounted volume.
 
 ## ext4 write support
 
-There is **no reliable free ext4 write driver for macOS** (the one thing paid
-tools genuinely add). Options, in order of safety:
+macOS has **no native ext4 write driver**, so dk splits the two cases by engine:
 
-1. Mount read-only with `dk mount` and copy files off.
-2. Write sessions via a Linux VM: [UTM](https://mac.getutm.app/) (free) with
-   the **QEMU backend** passes the USB drive to a Linux guest which mounts
-   ext4 natively read/write.
-3. Experimental: build `fuse2fs` from e2fsprogs source against macFUSE; if
-   found on PATH, `dk mount` uses it for r/w ext mounts (after an
-   automatic `e2fsck`, refusing if errors remain). Flaky — keep backups.
+- `dk mount <id>` reads ext with ext4fuse. A local mount, no VM.
+- `dk mount --rw <id>` writes with [anylinuxfs](https://github.com/nohajc/anylinuxfs)
+  (GPL-3) on Apple Silicon. It runs a small Linux microVM that mounts the
+  partition with the real kernel ext4 driver and exports it to macOS over NFS on
+  localhost, so the volume still shows up in Finder. The VM runs only while the
+  write session is open. `dk setup` installs it on Apple Silicon; `dk doctor`
+  reports it.
 
-If you'll write to the disk from the Mac regularly, the pragmatic move is
-`dk format diskX exfat` (after copying data off) — exFAT works natively
-on macOS, Windows, and Linux.
+**Behavior change (0.5.0):** plain `dk mount` on an ext volume is now read-only.
+Writing needs `--rw`. Previously a self-built `fuse2fs` made plain `dk mount`
+read-write.
+
+Trade-offs of a `--rw` session:
+
+- One VM per mounted volume, about 256 MB RAM each.
+- macOS sees the volume as a network (NFS) drive, so Spotlight and some apps
+  (editing a file in place) behave differently.
+- First run downloads an Alpine image into `~/.anylinuxfs/alpine`, so it needs
+  network once.
+- Apple Silicon only (libkrun).
+
+Fallbacks if anylinuxfs is not installed: `dk mount --rw` uses a self-built
+`fuse2fs` (from e2fsprogs against macFUSE) when present, after an automatic
+`e2fsck`; it is flaky, so keep backups. Otherwise mount read-only and copy
+files off, or pass the drive to a Linux guest in [UTM](https://mac.getutm.app/)
+(QEMU backend). For regular cross-platform writing, `dk format diskX exfat`
+(after copying data off) works natively on macOS, Windows, and Linux.
 
 ## Automount details
 
