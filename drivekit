@@ -65,6 +65,14 @@ part_num_of() { # partition id -> its number within the disk
   case "$DK_OS" in Darwin) printf '%s' "${1##*s}" ;; *) printf '%s' "${1##*[a-z]}" ;; esac
 }
 
+part_id() { # whole-disk id + partition number -> partition id
+  local disk="$1" n="$2"
+  case "$DK_OS" in
+    Darwin) printf '%ss%s' "$disk" "$n" ;;
+    *) case "$disk" in nvme*|mmcblk*|loop*) printf '%sp%s' "$disk" "$n" ;; *) printf '%s%s' "$disk" "$n" ;; esac ;;
+  esac
+}
+
 _partitions_of() { # whole-disk id -> its partition ids, one per line
   case "$DK_OS" in
     Darwin) external_partitions | grep -E "^${1}(s[0-9]+)?$" || true ;;
