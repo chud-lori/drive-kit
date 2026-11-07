@@ -16,6 +16,7 @@ os="$(uname)"
 if [[ "$os" == "Darwin" ]]; then
   if ! command -v brew >/dev/null 2>&1; then
     echo "Homebrew is required. Install it first:"
+    # shellcheck disable=SC2016  # literal install command for the user to copy
     echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
     exit 1
   fi
