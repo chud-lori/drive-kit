@@ -5,7 +5,7 @@
 #
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 DK_OS="$(uname)"   # Darwin or Linux; toolkit commands branch on this
 if [[ "$DK_OS" == "Darwin" ]]; then MOUNT_ROOT="${EXTDISK_MOUNT_ROOT:-/Volumes}"
 else MOUNT_ROOT="${EXTDISK_MOUNT_ROOT:-/media}"; fi
@@ -83,8 +83,9 @@ _partitions_of() { # whole-disk id -> its partition ids, one per line
 
 usage() {
   cat <<'EOF'
-dk — NTFS (read/write) and ext2/3/4 external drives on macOS,
-          using free open-source drivers.
+dk — NTFS (read/write) and ext2/3/4 external drives on macOS, using free
+          open-source drivers. On Linux: the disk toolkit (check/repair/format/
+          label/info/health/clone/partition/recover); mount natively.
 
 Disks:
   dk list                   external disks, partitions, filesystems, mount state
@@ -716,8 +717,15 @@ cmd_info() {
   local id kind
   id="$(single_target "${1:-}" info)"
   kind="$(part_kind "$id" probe)"
-  echo "${c_bold}== diskutil ==${c_off}"
-  diskutil info "$id" | grep -E 'Device Node|Volume Name|Disk Size|Volume Used|File System|Mounted|Mount Point|Media Name|Protocol|Content' || true
+  case "$DK_OS" in
+    Darwin)
+      echo "${c_bold}== diskutil ==${c_off}"
+      diskutil info "$id" | grep -E 'Device Node|Volume Name|Disk Size|Volume Used|File System|Mounted|Mount Point|Media Name|Protocol|Content' || true ;;
+    Linux)
+      echo "${c_bold}== lsblk ==${c_off}"
+      lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,MODEL "/dev/$id" || true
+      sudo blkid "/dev/$id" 2>/dev/null || true ;;
+  esac
   case "$kind" in
     ntfs)
       have ntfsinfo || die "ntfsinfo not installed — run: dk setup"
@@ -747,9 +755,33 @@ cmd_check() {
       echo "Checking ext filesystem on $id (read-only)..."
       if sudo e2fsck -f -n "/dev/$id"; then ok "$id looks consistent."
       else warn "Problems reported — see above. Fix with: dk repair $id"; return 1; fi ;;
-    exfat|fat|apfs/hfs)
-      echo "Checking $id with macOS's own verifier..."
-      diskutil verifyVolume "$id" ;;
+    exfat)
+      case "$DK_OS" in
+        Darwin)
+          echo "Checking $id with macOS's own verifier..."
+          diskutil verifyVolume "$id" ;;
+        *)
+          have fsck.exfat || die "exfatprogs not installed"
+          echo "Checking exFAT on $id (read-only)..."
+          sudo fsck.exfat -n "/dev/$id" ;;
+      esac ;;
+    fat)
+      case "$DK_OS" in
+        Darwin)
+          echo "Checking $id with macOS's own verifier..."
+          diskutil verifyVolume "$id" ;;
+        *)
+          have fsck.fat || die "dosfstools not installed"
+          echo "Checking FAT on $id (read-only)..."
+          sudo fsck.fat -n "/dev/$id" ;;
+      esac ;;
+    apfs/hfs)
+      case "$DK_OS" in
+        Darwin)
+          echo "Checking $id with macOS's own verifier..."
+          diskutil verifyVolume "$id" ;;
+        *) die "apfs/hfs check/repair is macOS-only" ;;
+      esac ;;
     *) die "Don't know how to check filesystem type: $kind" ;;
   esac
 }
@@ -772,9 +804,33 @@ cmd_repair() {
       sudo e2fsck -f -y "/dev/$id" || rc=$?
       if (( rc <= 2 )); then ok "Repair finished (exit $rc). Try: dk mount $id"
       else err "e2fsck could not fully repair $id (exit $rc)."; return 1; fi ;;
-    exfat|fat|apfs/hfs)
-      echo "Repairing $id with macOS's own repairer..."
-      diskutil repairVolume "$id" ;;
+    exfat)
+      case "$DK_OS" in
+        Darwin)
+          echo "Repairing $id with macOS's own repairer..."
+          diskutil repairVolume "$id" ;;
+        *)
+          have fsck.exfat || die "exfatprogs not installed"
+          echo "Repairing exFAT on $id ..."
+          sudo fsck.exfat -p "/dev/$id" ;;
+      esac ;;
+    fat)
+      case "$DK_OS" in
+        Darwin)
+          echo "Repairing $id with macOS's own repairer..."
+          diskutil repairVolume "$id" ;;
+        *)
+          have fsck.fat || die "dosfstools not installed"
+          echo "Repairing FAT on $id ..."
+          sudo fsck.fat -a "/dev/$id" ;;
+      esac ;;
+    apfs/hfs)
+      case "$DK_OS" in
+        Darwin)
+          echo "Repairing $id with macOS's own repairer..."
+          diskutil repairVolume "$id" ;;
+        *) die "apfs/hfs check/repair is macOS-only" ;;
+      esac ;;
     *) die "Don't know how to repair filesystem type: $kind" ;;
   esac
 }
@@ -797,7 +853,17 @@ cmd_label() {
       ensure_unmounted "$id"
       sudo e2label "/dev/$id" "$new" && ok "Label of $id set to \"$new\"" ;;
     exfat|fat|apfs/hfs)
-      diskutil rename "$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+      case "$DK_OS" in
+        Darwin) diskutil rename "$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+        Linux)  # unverified on macOS dev machine
+          case "$kind" in
+            exfat) have exfatlabel || die "exfatprogs not installed"
+                   sudo exfatlabel "/dev/$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+            fat)   have fatlabel || die "dosfstools not installed"
+                   sudo fatlabel "/dev/$id" "$new" && ok "Label of $id set to \"$new\"" ;;
+            apfs/hfs) die "apfs/hfs label is macOS-only" ;;
+          esac ;;
+      esac ;;
     *) die "Don't know how to label filesystem type: $kind" ;;
   esac
 }
@@ -805,8 +871,9 @@ cmd_label() {
 cmd_format() {
   local target="${1:-}" fs="${2:-}" label="${3:-Untitled}" id slice
   [[ -n "$target" && -n "$fs" ]] || die "Usage: dk format <diskX|diskXsY> <ntfs|ext4|ext3|ext2|exfat|fat32> [LABEL]"
-  [[ "$target" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || die "Not a disk identifier: $target"
-  diskutil info "$target" >/dev/null 2>&1 || die "No such disk: $target"
+  target="${target#/dev/}"
+  _id_ok "$target" || die "Not a disk identifier: $target"
+  _dev_exists "$target" || die "No such disk: $target"
   if [[ "${EXTDISK_ALLOW_INTERNAL:-}" != "1" ]] && ! is_external "$target"; then
     die "$target is an internal disk — refusing to format."
   fi
@@ -818,41 +885,69 @@ cmd_format() {
 
   local size name
   size="$(part_info "$target" TotalSize)"; name="$(part_info "$target" MediaName)"
-  [[ -n "$name" ]] || name="$(part_info "${target%s[0-9]*}" MediaName)"   # slices: use parent disk's name
+  [[ -n "$name" ]] || name="$(part_info "$(whole_disk_of "$target")" MediaName)"   # slices: use parent disk's name
   confirm_or_die "$target" \
     "THIS ERASES ALL DATA on $target (${name:-unknown device}, ${size:-?} bytes) -> $fs \"$label\""
 
-  if [[ "$target" =~ ^disk[0-9]+$ ]]; then
+  if _is_whole_disk "$target"; then
     # Whole disk: build a fresh GPT with one Microsoft Basic Data partition,
     # then lay the target filesystem over the data slice.
-    case "$fs" in
-      exfat)  diskutil eraseDisk ExFAT "$label" GPT "$target"; ok "Formatted $target as exFAT."; return 0 ;;
-      fat32)  diskutil eraseDisk "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" GPT "$target"; ok "Formatted $target as FAT32."; return 0 ;;
-      *)      diskutil partitionDisk "$target" 1 GPT ExFAT "TMPFMT" R >/dev/null
-              # find the new data slice from the target itself (EFI, if any, sorts first)
-              slice="$(diskutil list -plist "$target" 2>/dev/null \
-                | plutil -extract AllDisks json -o - - 2>/dev/null \
-                | tr -d '[]" ' | tr ',' '\n' | grep -E "^${target}s[0-9]+$" | tail -1)" || true
-              [[ -n "$slice" ]] || die "Could not find the new data partition on $target" ;;
+    case "$DK_OS" in
+      Darwin)
+        case "$fs" in
+          exfat)  diskutil eraseDisk ExFAT "$label" GPT "$target"; ok "Formatted $target as exFAT."; return 0 ;;
+          fat32)  diskutil eraseDisk "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" GPT "$target"; ok "Formatted $target as FAT32."; return 0 ;;
+          *)      diskutil partitionDisk "$target" 1 GPT ExFAT "TMPFMT" R >/dev/null
+                  # find the new data slice from the target itself (EFI, if any, sorts first)
+                  slice="$(diskutil list -plist "$target" 2>/dev/null \
+                    | plutil -extract AllDisks json -o - - 2>/dev/null \
+                    | tr -d '[]" ' | tr ',' '\n' | grep -E "^${target}s[0-9]+$" | tail -1)" || true
+                  [[ -n "$slice" ]] || die "Could not find the new data partition on $target" ;;
+        esac ;;
+      Linux)  # unverified on macOS dev machine
+        local tcode
+        case "$fs" in ext2|ext3|ext4) tcode=8300 ;; *) tcode=0700 ;; esac
+        sudo sgdisk -o -n "1:0:0" -t "1:$tcode" "/dev/$target"
+        sudo partprobe "/dev/$target" 2>/dev/null || true
+        slice="$(_partitions_of "$target" | tail -1)"
+        [[ -n "$slice" ]] || die "Could not find the new data partition on $target"
+        case "$fs" in
+          exfat)  have mkfs.exfat || die "exfatprogs not installed"
+                  sudo mkfs.exfat -n "$label" "$(raw_node "$slice")"; ok "Formatted $target as exFAT."; return 0 ;;
+          fat32)  have mkfs.vfat || die "dosfstools not installed"
+                  sudo mkfs.vfat -F 32 -n "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" "$(raw_node "$slice")"; ok "Formatted $target as FAT32."; return 0 ;;
+        esac ;;
     esac
   else
     slice="$target"
-    case "$fs" in
-      exfat)  ensure_unmounted "$slice"; diskutil eraseVolume ExFAT "$label" "$slice"; ok "Formatted $slice as exFAT."; return 0 ;;
-      fat32)  ensure_unmounted "$slice"; diskutil eraseVolume "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" "$slice"; ok "Formatted $slice as FAT32."; return 0 ;;
+    case "$DK_OS" in
+      Darwin)
+        case "$fs" in
+          exfat)  ensure_unmounted "$slice"; diskutil eraseVolume ExFAT "$label" "$slice"; ok "Formatted $slice as exFAT."; return 0 ;;
+          fat32)  ensure_unmounted "$slice"; diskutil eraseVolume "MS-DOS FAT32" "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" "$slice"; ok "Formatted $slice as FAT32."; return 0 ;;
+        esac ;;
+      Linux)  # unverified on macOS dev machine
+        case "$fs" in
+          exfat)  ensure_unmounted "$slice"; have mkfs.exfat || die "exfatprogs not installed"
+                  sudo mkfs.exfat -n "$label" "$(raw_node "$slice")"; ok "Formatted $slice as exFAT."; return 0 ;;
+          fat32)  ensure_unmounted "$slice"; have mkfs.vfat || die "dosfstools not installed"
+                  sudo mkfs.vfat -F 32 -n "$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]' | cut -c1-11)" "$(raw_node "$slice")"; ok "Formatted $slice as FAT32."; return 0 ;;
+        esac ;;
     esac
   fi
 
-  diskutil unmountDisk "${slice%s[0-9]*}" >/dev/null 2>&1 || true   # close async-automount race
+  case "$DK_OS" in
+    Darwin) diskutil unmountDisk "$(whole_disk_of "$slice")" >/dev/null 2>&1 || true ;;   # close async-automount race
+  esac
   ensure_unmounted "$slice"
   case "$fs" in
     ntfs)
-      echo "Creating NTFS on /dev/r$slice (mkntfs quick format)..."
-      sudo mkntfs -f -L "$label" "/dev/r$slice"
+      echo "Creating NTFS on $(raw_node "$slice") (mkntfs quick format)..."
+      sudo mkntfs -f -L "$label" "$(raw_node "$slice")"
       ok "Formatted $slice as NTFS \"$label\". Mount it: dk mount $slice" ;;
     ext2|ext3|ext4)
-      echo "Creating $fs on /dev/r$slice (mke2fs)..."
-      sudo mke2fs -t "$fs" -L "$label" "/dev/r$slice"
+      echo "Creating $fs on $(raw_node "$slice") (mke2fs)..."
+      sudo mke2fs -t "$fs" -L "$label" "$(raw_node "$slice")"
       ok "Formatted $slice as $fs \"$label\". Mount it: dk mount $slice" ;;
   esac
 }
@@ -1000,7 +1095,7 @@ cmd_health() {
   [[ -n "${1:-}" ]] || die "Which disk? e.g.: dk health disk4 (see: dk list)"
   # SMART is read-only, so it's safe on the internal disk too; accept whole disk or partition.
   id="$(EXTDISK_ALLOW_INTERNAL=1 expand_single "$1")"
-  whole="${id%s[0-9]*}"                    # strip trailing sN only; smartctl wants the whole disk
+  whole="$(whole_disk_of "$id")"           # smartctl wants the whole disk, not a partition
   node="/dev/$whole"
   have smartctl || die "smartmontools not installed — run: dk setup (or brew install smartmontools)"
   echo "Reading SMART health for $whole ..."
@@ -1069,20 +1164,20 @@ cmd_clone() {
   [[ -n "$src" && -n "$dst" ]] || die "Usage: dk clone <diskX|diskXsY> -o <image.img | diskY>   (image, or another disk)"
   have ddrescue || die "ddrescue not installed — run: dk recover deps --install"
   local srcp; srcp="$(expand_single "$src")"
-  local srcnode="/dev/r$srcp"
+  local srcnode; srcnode="$(raw_node "$srcp")"
   ensure_unmounted "$srcp"
-  if [[ "$dst" =~ ^disk[0-9]+(s[0-9]+)?$ ]] || [[ "$dst" == /dev/* ]]; then
+  if _id_ok "${dst#/dev/}" || [[ "$dst" == /dev/* ]]; then
     # disk-to-disk (or partition): DESTRUCTIVE to target
     local tgt="${dst#/dev/}"; tgt="${tgt#r}"
-    diskutil info "$tgt" >/dev/null 2>&1 || die "No such target disk: $dst"
+    _dev_exists "$tgt" || die "No such target disk: $dst"
     is_external "$tgt" || [[ "${EXTDISK_ALLOW_INTERNAL:-}" == 1 ]] || die "Target $tgt is internal — refusing."
     local ssz tsz; ssz="$(part_info "$srcp" TotalSize)"; tsz="$(part_info "$tgt" TotalSize)"
     [[ -z "$ssz" || -z "$tsz" ]] || (( tsz >= ssz )) || die "Target ($(human "$tsz")) is smaller than source ($(human "$ssz"))."
     confirm_or_die "$tgt" "CLONE $srcp -> $tgt ERASES ALL DATA on $tgt ($(human "${tsz:-0}"))."
     ensure_unmounted "$tgt"
     echo "Cloning $srcp -> $tgt (ddrescue)..."
-    sudo ddrescue -f "$srcnode" "/dev/r$tgt" "$(scratch_map "$tgt")"
-    ok "Clone complete. Verify: sudo cmp -n ${ssz:-0} $srcnode /dev/r$tgt"
+    sudo ddrescue -f "$srcnode" "$(raw_node "$tgt")" "$(scratch_map "$tgt")"
+    ok "Clone complete. Verify: sudo cmp -n ${ssz:-0} $srcnode $(raw_node "$tgt")"
   else
     # disk-to-image file
     local img="$dst"; [[ "$img" == /* ]] || img="$(pwd)/$img"
@@ -1108,13 +1203,13 @@ scratch_map() { printf '%s' "${TMPDIR:-/tmp}/dk-clone-$1.map"; }
 
 guard_image_dir() { # refuse writing the image onto the source disk
   local img="$1" src="$2" dir dev
-  local src_whole="${src%s[0-9]*}"
+  local src_whole; src_whole="$(whole_disk_of "$src")"
   dir="$(dirname "$img")"
   while [[ ! -d "$dir" && "$dir" != "/" ]]; do dir="$(dirname "$dir")"; done   # nearest existing ancestor
   [[ -d "$dir" ]] || die "Cannot resolve a location for $img"
   dev="$(df "$dir" 2>/dev/null | awk 'NR==2{print $1}')"
   dev="${dev#/dev/}"; dev="${dev#r}"
-  [[ ! "$dev" =~ ^${src_whole}(s[0-9]+)?$ ]] || die "Refusing to write the image onto the source disk ($src). Pick another location."
+  [[ "$(whole_disk_of "$dev")" != "$src_whole" ]] || die "Refusing to write the image onto the source disk ($src). Pick another location."
 }
 
 # ---------- partition (shrink/grow/create/delete/list) ----------
@@ -1137,7 +1232,7 @@ part_require() {
 part_list() {
   local disk="${1:-}"
   [[ -n "$disk" ]] || die "Usage: dk partition list <diskX>"
-  disk="$(expand_single "${disk%s[0-9]*}")"
+  disk="$(expand_single "$(whole_disk_of "$disk")")"
   part_require
   echo "${c_bold}Partitions on $disk:${c_off}"
   sudo sgdisk -p "/dev/$disk"
@@ -1148,9 +1243,10 @@ part_resize() {
   local mode="$1" id="${2:-}" size="${3:-}"
   [[ -n "$id" ]] || die "Usage: dk partition $mode <diskXsY> <newsize e.g. 200G>   (grow: size optional = fill free space)"
   id="$(expand_single "$id")"
-  [[ "$id" == *s* ]] || die "$id is a whole disk — give a partition like ${id}s1"
+  ! _is_whole_disk "$id" || die "$id is a whole disk — give a partition (e.g. $(part_id "$id" 1))"
   part_require
-  local disk="${id%s[0-9]*}" pnum="${id##*s}" kind
+  local disk pnum kind
+  disk="$(whole_disk_of "$id")"; pnum="$(part_num_of "$id")"
   kind="$(part_kind "$id" probe)"
   case "$kind" in
     ext) have resize2fs || die "resize2fs not installed — run: dk setup" ;;
@@ -1209,18 +1305,18 @@ part_resize() {
 part_delete() {
   local id="${1:-}"
   [[ -n "$id" ]] || die "Usage: dk partition delete <diskXsY>"
-  id="$(expand_single "$id")"; [[ "$id" == *s* ]] || die "Give a partition (diskXsY), not a whole disk"
+  id="$(expand_single "$id")"; ! _is_whole_disk "$id" || die "Give a partition, not a whole disk"
   part_require
   ensure_unmounted "$id"
   confirm_or_die "$id" "DELETE partition $id — its data becomes unreachable."
-  sudo sgdisk -d "${id##*s}" "/dev/${id%s[0-9]*}"; sudo sgdisk -e "/dev/${id%s[0-9]*}"
-  rescan_disk "${id%s[0-9]*}"; ok "Deleted $id."
+  sudo sgdisk -d "$(part_num_of "$id")" "/dev/$(whole_disk_of "$id")"; sudo sgdisk -e "/dev/$(whole_disk_of "$id")"
+  rescan_disk "$(whole_disk_of "$id")"; ok "Deleted $id."
 }
 
 part_create() {
   local disk="${1:-}" fs="${2:-}" label="${3:-Untitled}"
   [[ -n "$disk" && -n "$fs" ]] || die "Usage: dk partition create <diskX> <ext4|ntfs|exfat> [LABEL]   (fills free space)"
-  disk="$(expand_single "${disk%s[0-9]*}")"; part_require
+  disk="$(expand_single "$(whole_disk_of "$disk")")"; part_require
   confirm_or_die "$disk" "Create a new $fs partition in free space on $disk."
   local before after pnum
   before="$(sudo sgdisk -p "/dev/$disk" | awk '/^ +[0-9]+ /{print $1}' | sort -n)"
@@ -1229,7 +1325,7 @@ part_create() {
   after="$(sudo sgdisk -p "/dev/$disk" | awk '/^ +[0-9]+ /{print $1}' | sort -n)"
   pnum="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)"
   [[ -n "$pnum" ]] || die "Partition created but could not determine its number — check: dk partition list $disk"
-  ok "Created partition ${disk}s${pnum}. Format it:  dk format ${disk}s${pnum} $fs \"$label\""
+  ok "Created partition $(part_id "$disk" "$pnum"). Format it:  dk format $(part_id "$disk" "$pnum") $fs \"$label\""
 }
 
 fs_sectors_ext() { # partition bytes currently used by the ext fs, in 512-byte sectors
@@ -1266,6 +1362,12 @@ main() {
     if [[ "$a" == "--yes" || "$a" == "-y" ]]; then EXTDISK_YES=1; else args+=("$a"); fi
   done
   set -- "${args[@]+"${args[@]}"}"
+  if [[ "$DK_OS" != "Darwin" ]]; then
+    case "$cmd" in
+      mount|unmount|umount|eject|automount|daemon|benchmark|bench|speed|remove-paragon)
+        die "dk $cmd is macOS-only. On Linux mount/unmount natively; dk covers check/repair/label/format/info/health/clone/partition/recover." ;;
+    esac
+  fi
   case "$cmd" in
     list|ls|status)       cmd_list "$@" ;;
     doctor)               cmd_doctor "$@" ;;
