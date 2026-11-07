@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# dk — NTFS (read/write) and ext2/3/4 external drives on Apple Silicon macOS
-# using free open-source drivers (no Paragon/Tuxera needed).
+# dk — NTFS (read/write) and ext2/3/4 external drives on macOS using free
+# open-source drivers (no Paragon/Tuxera needed); a check/repair/format/recover
+# toolkit on Linux (mounting there is native).
 #
 set -euo pipefail
 
