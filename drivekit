@@ -61,6 +61,10 @@ _is_whole_disk() {
   esac
 }
 
+part_num_of() { # partition id -> its number within the disk
+  case "$DK_OS" in Darwin) printf '%s' "${1##*s}" ;; *) printf '%s' "${1##*[a-z]}" ;; esac
+}
+
 _partitions_of() { # whole-disk id -> its partition ids, one per line
   case "$DK_OS" in
     Darwin) external_partitions | grep -E "^${1}(s[0-9]+)?$" || true ;;
