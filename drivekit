@@ -361,6 +361,7 @@ cmd_list() {
 }
 
 cmd_doctor() {
+  [[ "$DK_OS" == "Darwin" ]] || { _doctor_linux; return $?; }
   local all_ok=1
   echo "${c_bold}dk doctor${c_off} (macOS $(sw_vers -productVersion), $(uname -m))"
   echo
@@ -421,6 +422,7 @@ cmd_doctor() {
 }
 
 cmd_setup() {
+  [[ "$DK_OS" == "Darwin" ]] || { _setup_linux; return $?; }
   have brew || die "Homebrew required — install from https://brew.sh first."
   # Stack (verified July 2026, Apple Silicon / macOS 15):
   #   macfuse cask        — FUSE layer (kext backend preferred; FSKit fallback >=15.4)
@@ -446,6 +448,47 @@ cmd_setup() {
   echo "${c_bold}One-time step:${c_off} enable the macFUSE file-system extension in"
   echo "  System Settings > General > Login Items & Extensions > File System Extensions"
   echo "and, if prompted after your first mount, approve macFUSE in Privacy & Security."
+  echo
+  cmd_doctor
+}
+
+# On Linux the kernel mounts ext/ntfs/exfat natively; dk only needs the toolkit binaries.
+_doctor_linux() {
+  local all_ok=1
+  echo "${c_bold}dk doctor${c_off} ($(uname -s) $(uname -r), $(uname -m))"
+  echo
+  if have e2fsck && have mke2fs && have e2label; then ok "e2fsprogs (ext check/repair/format/label)"
+  else err "e2fsprogs missing — run: dk setup"; all_ok=0; fi
+  if have ntfsfix && have ntfslabel && have mkntfs && have ntfsinfo; then ok "ntfs-3g tools (ntfsfix, ntfslabel, mkntfs, ntfsinfo)"
+  else warn "ntfs-3g tools missing (NTFS check/repair/format/label) — run: dk setup"; fi
+  if have mkfs.exfat && have fsck.exfat; then ok "exfatprogs (exfat format/check/label)"
+  else warn "exfatprogs missing (exfat format/check) — run: dk setup"; fi
+  if have mkfs.vfat && have fsck.fat; then ok "dosfstools (fat format/check)"
+  else warn "dosfstools missing (fat format/check) — run: dk setup"; fi
+  if have lsblk && have findmnt && have blkid; then ok "util-linux (lsblk, findmnt, blkid)"
+  else err "util-linux missing (lsblk/findmnt/blkid) — run: dk setup"; all_ok=0; fi
+  if have sgdisk; then ok "gptfdisk (sgdisk — partitioning)"
+  else warn "sgdisk missing (dk partition / whole-disk format) — run: dk setup"; fi
+  if have smartctl; then ok "smartmontools (dk health)"
+  else warn "smartmontools missing (dk health) — run: dk setup"; fi
+  if have ddrescue; then ok "ddrescue (dk clone / recover image)"
+  else warn "ddrescue missing (dk clone) — run: dk setup"; fi
+  echo "  ${c_dim}Mounting is native on Linux (use 'mount'); dk provides the toolkit: check/repair/format/label/info/health/clone/partition/recover.${c_off}"
+  echo
+  if [[ "$all_ok" == 1 ]]; then ok "Toolkit ready."
+  else warn "Fix the items above, then re-run: dk doctor"; return 1; fi
+}
+
+_setup_linux() {
+  local pm pkgs
+  if have apt-get;  then pm="sudo apt-get install -y";          pkgs="e2fsprogs ntfs-3g exfatprogs dosfstools util-linux gdisk smartmontools gddrescue"
+  elif have dnf;    then pm="sudo dnf install -y";              pkgs="e2fsprogs ntfs-3g exfatprogs dosfstools util-linux gdisk smartmontools ddrescue"
+  elif have pacman; then pm="sudo pacman -S --needed --noconfirm"; pkgs="e2fsprogs ntfs-3g exfatprogs dosfstools util-linux gptfdisk smartmontools ddrescue"
+  elif have zypper; then pm="sudo zypper install -y";          pkgs="e2fsprogs ntfs-3g exfatprogs dosfstools util-linux gptfdisk smartmontools gddrescue"
+  else die "No supported package manager (apt/dnf/pacman/zypper) — install manually: e2fsprogs ntfs-3g exfatprogs dosfstools util-linux gdisk smartmontools ddrescue"; fi
+  echo "Installing the Linux toolkit stack ($pkgs)..."
+  # shellcheck disable=SC2086  # pm and pkgs are intentionally word-split
+  $pm $pkgs
   echo
   cmd_doctor
 }
