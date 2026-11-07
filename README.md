@@ -56,7 +56,6 @@ dk repair disk4s1        # fix dirty NTFS volume / full ext fsck
 dk label disk4s1 BACKUP  # rename volume
 dk format disk4 ntfs "My Disk"   # DESTRUCTIVE — asks for confirmation
 dk info disk4s1          # detailed filesystem info
-dk remove-paragon        # cleanly strip a Paragon NTFS install/leftovers
 ```
 
 `mount`, `unmount`, etc. accept `diskX` (whole disk) or `diskXsY` (one
@@ -201,10 +200,6 @@ the macFUSE **kext** backend (FSKit is per-user and unavailable to daemons).
 - **Drive doesn't appear in `dk list` at all** → not a filesystem problem.
   Check cable/port and `system_profiler SPUSBDataType`. Spinning 2.5" HDDs can
   fail on low-power hubs — plug directly into the Mac.
-- **Paragon NTFS installed or left over** → it intercepts NTFS drives before
-  dk can (and when its trial expires, disks may stop mounting at all —
-  they look "undetected"). `dk doctor` detects it; `dk remove-paragon`
-  removes it using Paragon's own uninstaller plus leftover cleanup. Reboot after.
 - **NTFS volume won't mount, "dirty" errors** → unclean Windows shutdown/unplug:
   `dk repair diskXsY`, or plug into Windows once and eject properly.
 - **"Journal needs recovery" on ext** → `dk repair diskXsY` (runs e2fsck).

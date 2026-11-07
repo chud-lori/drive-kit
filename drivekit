@@ -119,7 +119,6 @@ Data recovery (deleted files / formatted disks):
 Setup:
   dk doctor                 check that required drivers/tools are installed
   dk setup                  install the free driver stack via Homebrew
-  dk remove-paragon         cleanly remove a Paragon NTFS installation/leftovers
 EOF
 }
 
@@ -387,10 +386,6 @@ cmd_doctor() {
 
   if [[ -d "/Library/Frameworks/fuse_t.framework" ]]; then
     warn "fuse-t is installed, but dk's drivers are built against macFUSE and won't use it."
-  fi
-  if [[ -d "/Library/Filesystems/ufsd_NTFS.fs" ]] || [[ -d "/Library/Extensions/ufsd_NTFS.kext" ]]; then
-    warn "Paragon NTFS driver present — it intercepts NTFS disks before dk can."
-    echo "    Remove it with: dk remove-paragon"
   fi
 
   if have ntfs-3g; then ok "ntfs-3g: $(ntfs-3g --version 2>&1 | head -1)"; else
@@ -1026,69 +1021,6 @@ EOF
   esac
 }
 
-# ---------- paragon removal ----------
-cmd_remove_paragon() {
-  [[ "$(id -u)" != "0" ]] || die "Run remove-paragon as your normal user (it uses sudo where needed) — running it under sudo would skip your user-level Paragon files."
-  local vendor="/Library/Application Support/Paragon Software/com.paragon-software.ntfs.uninstall"
-  local found=0 f
-  echo "${c_bold}Paragon NTFS components on this Mac:${c_off}"
-  for f in /Library/Filesystems/ufsd_NTFS.fs /Library/Extensions/ufsd_NTFS.kext \
-           "/Library/Application Support/Paragon Software" \
-           /Library/LaunchDaemons/com.paragon-software.ntfsd.plist \
-           /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist \
-           /Library/LaunchDaemons/com.paragon-software.installer.plist \
-           /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist \
-           /Library/PrivilegedHelperTools/com.paragon-software.installer \
-           /Library/PreferencePanes/ParagonNTFS.prefPane; do
-    [[ -e "$f" ]] && { echo "  $f"; found=1; }
-  done
-  if kmutil showloaded 2>/dev/null | grep -qi -e ufsd -e paragon; then
-    echo "  (kernel driver currently LOADED)"; found=1
-  fi
-  [[ "$found" == 1 ]] || { ok "No Paragon NTFS components found — nothing to remove."; return 0; }
-
-  confirm_or_die "REMOVE" \
-    "This permanently removes Paragon NTFS from this Mac (needs sudo)." \
-    "After removal, NTFS goes back to macOS native read-only until you use dk."
-
-  if [[ -x "$vendor" ]]; then
-    echo "Running Paragon's own uninstaller..."
-    sudo "$vendor" || warn "Vendor uninstaller reported errors; continuing with cleanup."
-  fi
-
-  echo "Cleaning up what the vendor uninstaller leaves behind..."
-  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.ntfsd.plist 2>/dev/null || true
-  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist 2>/dev/null || true
-  sudo launchctl bootout system /Library/LaunchDaemons/com.paragon-software.installer.plist 2>/dev/null || true
-  launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist 2>/dev/null || true
-  sudo kextunload -b com.paragon-software.filesystems.ntfs 2>/dev/null || true
-  sudo rm -rf /Library/Filesystems/ufsd_NTFS.fs /Library/Extensions/ufsd_NTFS.kext \
-    /Library/LaunchDaemons/com.paragon-software.ntfsd.plist \
-    /Library/LaunchDaemons/com.paragon-software.ntfs.loader.plist \
-    /Library/LaunchDaemons/com.paragon-software.installer.plist \
-    /Library/LaunchAgents/com.paragon-software.ntfs.notification-agent.plist \
-    /Library/PrivilegedHelperTools/com.paragon-software.installer \
-    "/Library/Application Support/Paragon Software" \
-    /Library/PreferencePanes/ParagonNTFS.prefPane \
-    /usr/local/sbin/fsck_ufsd_NTFS /usr/local/sbin/mount_ufsd_NTFS /usr/local/sbin/newfs_ufsd_NTFS
-  rm -rf ~/Library/Preferences/com.paragon-software.ntfs* \
-         ~/Library/Caches/com.paragon-software.ntfs* \
-         ~/Library/HTTPStorages/com.paragon-software.ntfs* \
-         ~/Library/WebKit/com.paragon-software.ntfs.fsapp \
-         ~/Library/Saved\ Application\ State/com.paragon-software.ntfs.fsapp.savedState 2>/dev/null || true
-  local pkg
-  for pkg in $(pkgutil --pkgs 2>/dev/null | grep -i paragon); do
-    sudo pkgutil --forget "$pkg" >/dev/null && echo "  forgot receipt: $pkg"
-  done
-  sudo kmutil clear-staging 2>/dev/null || true
-
-  if kmutil showloaded 2>/dev/null | grep -qi -e ufsd -e paragon; then
-    warn "The Paragon kernel driver is still loaded in memory — REBOOT to finish removal."
-  else
-    ok "Paragon NTFS fully removed."
-  fi
-  echo "Verify afterwards with: dk doctor"
-}
 
 # ---------- health (SMART) ----------
 cmd_health() {
@@ -1365,7 +1297,7 @@ main() {
   set -- "${args[@]+"${args[@]}"}"
   if [[ "$DK_OS" != "Darwin" ]]; then
     case "$cmd" in
-      mount|unmount|umount|eject|automount|daemon|benchmark|bench|speed|remove-paragon)
+      mount|unmount|umount|eject|automount|daemon|benchmark|bench|speed)
         die "dk $cmd is macOS-only. On Linux mount/unmount natively; dk covers check/repair/label/format/info/health/clone/partition/recover." ;;
     esac
   fi
@@ -1387,7 +1319,6 @@ main() {
     benchmark|bench|speed) cmd_benchmark "$@" ;;
     clone)                cmd_clone "$@" ;;
     partition|part)       cmd_partition "$@" ;;
-    remove-paragon)       cmd_remove_paragon "$@" ;;
     -h|--help|help)       usage ;;
     -v|--version)         echo "dk $VERSION" ;;
     *) usage >&2; die "Unknown command: $cmd" ;;
