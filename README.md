@@ -4,8 +4,7 @@ A free disk toolkit for the Mac (and a check/repair/format/recover toolkit on
 Linux — see below). Run it as `drivekit` or the short alias `dk`.
 
 Mount **NTFS (read/write)** and **ext2/3/4** external drives, verify/repair/format
-disks, and **recover deleted or lost data** — all with free open-source engines.
-A free replacement for Paragon NTFS/extFS and Disk Drill / EaseUS.
+disks, and **recover deleted or lost data**, all with free open-source engines.
 
 Verified on macOS 15 (Sequoia), July 2026.
 
@@ -13,11 +12,11 @@ Everything mounts under `/Volumes` like a normal disk, so drives show up
 **in Finder** (and to every app) — the tool is only the on/off switch, not a
 gateway you browse files through.
 
-## Feature parity with Paragon
+## What it does
 
-| Paragon feature | dk | How |
+| Task | dk | How |
 |---|---|---|
-| NTFS read/write | ✅ `dk mount` | ntfs-3g (same engine Paragon competes with) |
+| NTFS read/write | ✅ `dk mount` | ntfs-3g |
 | Auto-mount r/w on plug-in | ✅ `dk automount enable` | root LaunchDaemon + ntfs-3g |
 | Read-only mode | ✅ `dk mount --ro` | native driver |
 | Verify / repair | ✅ `dk check` / `repair` | ntfsfix, e2fsck |
@@ -51,7 +50,7 @@ dk mount                 # mount everything (NTFS read-write; ext read-only)
 dk mount --ro disk4      # read-only session
 dk mount --rw disk4s1    # ext read-write via a Linux VM (Apple Silicon)
 dk unmount               # then unplug — only after "Safe to unplug"
-dk automount enable      # Paragon-style: NTFS auto-mounts r/w on plug-in
+dk automount enable      # NTFS auto-mounts read-write on plug-in
 dk check disk4s1         # verify filesystem (no changes)
 dk repair disk4s1        # fix dirty NTFS volume / full ext fsck
 dk label disk4s1 BACKUP  # rename volume
@@ -117,10 +116,9 @@ proving data survives a shrink-and-grow round-trip.
 
 ## Data recovery (deleted files & formatted disks)
 
-A free alternative to Disk Drill / EaseUS (~$90+). Those apps are mostly polished
-wrappers around the same open-source engines this uses: **The Sleuth Kit**
-(metadata undelete), **PhotoRec** (signature carving), **GNU ddrescue** (imaging
-failing drives). Works on macOS **and Linux**. Recovery pipelines were validated
+Built on proven open-source engines: **The Sleuth Kit** (metadata undelete),
+**PhotoRec** (signature carving), and **GNU ddrescue** (imaging failing
+drives). Works on macOS **and Linux**. Recovery pipelines were validated
 end-to-end on scratch disk images with byte-for-byte checksum matches before shipping.
 
 ```sh
@@ -184,8 +182,7 @@ Trade-offs of a `--rw` session:
 Fallbacks if anylinuxfs is not installed: `dk mount --rw` uses a self-built
 `fuse2fs` (from e2fsprogs against macFUSE) when present, after an automatic
 `e2fsck`; it is flaky, so keep backups. Otherwise mount read-only and copy
-files off, or pass the drive to a Linux guest in [UTM](https://mac.getutm.app/)
-(QEMU backend). For regular cross-platform writing, `dk format diskX exfat`
+files off. For regular cross-platform writing, `dk format diskX exfat`
 (after copying data off) works natively on macOS, Windows, and Linux.
 
 ## Automount details

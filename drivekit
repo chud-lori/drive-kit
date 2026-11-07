@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # dk — NTFS (read/write) and ext2/3/4 external drives on macOS using free
-# open-source drivers (no Paragon/Tuxera needed); a check/repair/format/recover
-# toolkit on Linux (mounting there is native).
+# open-source drivers; a check/repair/format/recover toolkit on Linux
+# (mounting there is native).
 #
 set -euo pipefail
 
@@ -94,7 +94,7 @@ Disks:
   dk unmount [id]           unmount so the drive can be unplugged safely
   dk info <id>              detailed volume/filesystem info
 
-Maintenance (Paragon-style):
+Maintenance:
   dk check <id>             verify filesystem (read-only, no changes)
   dk repair <id>            repair: full fsck for ext; journal/dirty-flag reset for NTFS
   dk label <id> [NAME]      show or change the volume label
@@ -713,7 +713,7 @@ cmd_unmount() {
   else ok "Nothing was mounted. Safe to unplug."; fi
 }
 
-# ---------- maintenance commands (Paragon parity) ----------
+# ---------- maintenance commands ----------
 cmd_info() {
   local id kind
   id="$(single_target "${1:-}" info)"
